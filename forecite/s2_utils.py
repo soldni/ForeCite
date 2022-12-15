@@ -397,4 +397,3 @@ def full_data_collection_parallel(s2_ids: List[str], num_processes: int = 1):
         s2_id_to_references,
         s2_id_to_canonical,
     )
-

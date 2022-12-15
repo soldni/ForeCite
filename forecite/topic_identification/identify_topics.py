@@ -9,9 +9,10 @@ import math
 from tqdm import tqdm
 from collections import Counter
 
-from forecite.consts import *
+from forecite.consts import Constants
 from forecite.topic_identification.generate_dataset import get_date_key_from_arxiv_id
 from forecite.eval_utils import topic_score
+
 
 
 def get_all_candidate_strings_for_n_gram(
@@ -307,40 +308,42 @@ def compute_loor_score(
     return [list(noun_phrase_cluster), score]
 
 
-def identify_topics_arxiv_no_refs(method: str, candidates: str):
+def identify_topics_arxiv_no_refs(
+    method: str, candidates: str, const: Constants
+):
     """
     Function to compute topics for arxiv cs with references clipped
     """
     print("Loading title noun_phrases...")
-    with open(NO_REFS_ARXIV_CS_TITLE_NPS_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_TITLE_NPS_PATH) as _json_file:
         title_noun_phrases = json.load(_json_file)
 
     print("Loading abstract noun_phrases...")
-    with open(NO_REFS_ARXIV_CS_ABSTRACT_NPS_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_ABSTRACT_NPS_PATH) as _json_file:
         abstract_noun_phrases = json.load(_json_file)
 
     print("Loading body noun_phrases...")
-    with open(NO_REFS_ARXIV_CS_BODY_NPS_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_BODY_NPS_PATH) as _json_file:
         body_noun_phrases = json.load(_json_file)
 
     print("Loading normalization...")
-    with open(NO_REFS_ARXIV_CS_NORMALIZATION_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_NORMALIZATION_PATH) as _json_file:
         phrase_normalization = json.load(_json_file)
 
     print("Loading citng ids...")
-    with open(NO_REFS_ARXIV_CS_CITING_IDS_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_CITING_IDS_PATH) as _json_file:
         s2_id_to_citing_ids = json.load(_json_file)
 
     print("Loading references...")
-    with open(NO_REFS_ARXIV_CS_REFERENCES_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_REFERENCES_PATH) as _json_file:
         s2_id_to_references = json.load(_json_file)
 
     print("Loading canonicalization...")
-    with open(NO_REFS_ARXIV_CS_CANONICALIZATION_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_CANONICALIZATION_PATH) as _json_file:
         s2_id_to_canonical = json.load(_json_file)
 
     print("Loading arxiv to s2 mapping...")
-    with open(NO_REFS_ARXIV_CS_TO_S2_MAPPING_PATH) as _json_file:
+    with open(const.NO_REFS_ARXIV_CS_TO_S2_MAPPING_PATH) as _json_file:
         arxiv_to_s2_mapping = json.load(_json_file)
 
     s2_id_to_date_key = {
@@ -428,8 +431,8 @@ def identify_topics_arxiv_no_refs(method: str, candidates: str):
             (
                 result[0],
                 topic_score(
-                    result[1][0][TERM_OCCURRENCES_INDEX],
-                    result[1][0][TERM_CITATIONS_INDEX],
+                    result[1][0][const.TERM_OCCURRENCES_INDEX],
+                    result[1][0][const.TERM_CITATIONS_INDEX],
                 ),
                 result[1],
             )
@@ -443,18 +446,18 @@ def identify_topics_arxiv_no_refs(method: str, candidates: str):
 
     if candidates == "title":
         if method == "forecite":
-            output_file_path = NO_REFS_ARXIV_CS_TITLE_CANDIDATES_SCORES_PATH
+            output_file_path = const.NO_REFS_ARXIV_CS_TITLE_CANDIDATES_SCORES_PATH
         elif method == "cnlc":
-            output_file_path = NO_REFS_ARXIV_CS_TITLE_CANDIDATES_CNLC_PATH
+            output_file_path = const.NO_REFS_ARXIV_CS_TITLE_CANDIDATES_CNLC_PATH
         elif method == "loor":
-            output_file_path = NO_REFS_ARXIV_CS_TITLE_CANDIDATES_LOOR_PATH
+            output_file_path = const.NO_REFS_ARXIV_CS_TITLE_CANDIDATES_LOOR_PATH
     elif candidates == "abstract":
         if method == "forecite":
-            output_file_path = NO_REFS_ARXIV_CS_ABSTRACT_CANDIDATES_SCORES_PATH
+            output_file_path = const.NO_REFS_ARXIV_CS_ABSTRACT_CANDIDATES_SCORES_PATH
         elif method == "cnlc":
-            output_file_path = NO_REFS_ARXIV_CS_ABSTRACT_CANDIDATES_CNLC_PATH
+            output_file_path = const.NO_REFS_ARXIV_CS_ABSTRACT_CANDIDATES_CNLC_PATH
         elif method == "loor":
-            output_file_path = NO_REFS_ARXIV_CS_ABSTRACT_CANDIDATES_LOOR_PATH
+            output_file_path = const.NO_REFS_ARXIV_CS_ABSTRACT_CANDIDATES_LOOR_PATH
     print("Dumping citation score output to {}".format(output_file_path))
     with open(output_file_path, "w") as _json_file:
         json.dump(score_results, _json_file)
@@ -464,12 +467,23 @@ def identify_topics_arxiv_no_refs(method: str, candidates: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--root",
+        default=Constants.PROJECT_ROOT,
+        help="Root directory for project"
+    )
     parser.add_argument("--dataset", help="Which dataset to run on")
     parser.add_argument("--method", help="Which method to use to score topics")
     parser.add_argument("--candidates", help="What candidate set to use")
     args = parser.parse_args()
 
+    const = Constants(PROJECT_ROOT=args.root)
+
     if args.dataset == "arxiv_no_refs":
-        identify_topics_arxiv_no_refs(args.method, args.candidates)
+        identify_topics_arxiv_no_refs(
+            method=args.method,
+            candidates=args.candidates,
+            const=const
+        )
     else:
         raise Exception(f"Dataset {args.dataset} not supported")

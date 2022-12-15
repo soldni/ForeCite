@@ -1,6 +1,6 @@
-spacy==2.2.2
+spacy==3.4.4
 nltk
-scispacy==0.2.4
+scispacy==0.5.1
 numpy
 matplotlib
 seaborn
