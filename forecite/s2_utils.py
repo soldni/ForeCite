@@ -15,7 +15,6 @@ from tqdm import tqdm
 from multiprocessing import Manager
 from spacy.tokens.token import Token
 from spacy.language import Language
-from forecite.consts import *
 
 from nltk.corpus import stopwords
 

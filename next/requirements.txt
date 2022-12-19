@@ -1,0 +1,6 @@
+springs>=1.9.1
+s3fs>=2022.11.0
+fsspec>=2022.11.0
+textacy
+spacy
+cached_path

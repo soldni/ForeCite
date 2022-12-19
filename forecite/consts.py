@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
+
 
 class Constants:
-    PROJECT_ROOT: str = os.path.abspath(os.path.dirname(__file__))
+    DATA_ROOT: str = os.path.join(
+        os.path.expanduser("~"), ".cache", "forecite"
+    )
 
     # Related to the output format of the citation scores
     TERM_OCCURRENCES_INDEX: int = 2
@@ -11,9 +15,7 @@ class Constants:
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-    @property
-    def DATA_ROOT(self) -> str:
-        return os.path.join(self.PROJECT_ROOT, os.pardir, "data")
+        Path(self.DATA_ROOT).mkdir(parents=True, exist_ok=True)
 
     @property
     def TOPICID_DATA_ROOT(self):

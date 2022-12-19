@@ -10,7 +10,7 @@ from tqdm import tqdm
 from collections import Counter
 
 from forecite.consts import Constants
-from forecite.topic_identification.generate_dataset import get_date_key_from_arxiv_id
+# from forecite.topic_identification.generate_dataset import get_date_key_from_arxiv_id
 from forecite.eval_utils import topic_score
 
 
@@ -330,7 +330,7 @@ def identify_topics_arxiv_no_refs(
     with open(const.NO_REFS_ARXIV_CS_NORMALIZATION_PATH) as _json_file:
         phrase_normalization = json.load(_json_file)
 
-    print("Loading citng ids...")
+    print("Loading citing ids...")
     with open(const.NO_REFS_ARXIV_CS_CITING_IDS_PATH) as _json_file:
         s2_id_to_citing_ids = json.load(_json_file)
 
@@ -346,10 +346,12 @@ def identify_topics_arxiv_no_refs(
     with open(const.NO_REFS_ARXIV_CS_TO_S2_MAPPING_PATH) as _json_file:
         arxiv_to_s2_mapping = json.load(_json_file)
 
-    s2_id_to_date_key = {
-        value: get_date_key_from_arxiv_id(key)
-        for key, value in arxiv_to_s2_mapping.items()
-    }
+    import ipdb; ipdb.set_trace()
+
+    # s2_id_to_date_key = {
+    #     value: get_date_key_from_arxiv_id(key)
+    #     for key, value in arxiv_to_s2_mapping.items()
+    # }
 
     combined_noun_phrases = merge_noun_phrase_dicts(
         title_noun_phrases, abstract_noun_phrases, body_noun_phrases
@@ -469,7 +471,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--root",
-        default=Constants.PROJECT_ROOT,
+        default=Constants.DATA_ROOT,
         help="Root directory for project"
     )
     parser.add_argument("--dataset", help="Which dataset to run on")
@@ -477,7 +479,7 @@ if __name__ == "__main__":
     parser.add_argument("--candidates", help="What candidate set to use")
     args = parser.parse_args()
 
-    const = Constants(PROJECT_ROOT=args.root)
+    const = Constants(DATA_ROOT=args.root)
 
     if args.dataset == "arxiv_no_refs":
         identify_topics_arxiv_no_refs(
