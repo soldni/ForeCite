@@ -1,14 +1,14 @@
 UNLOAD (
     SELECT
-            id,
-            MAX(title) as title,
-            MAX(abstract) as abstract,
-            MAX(year) as year,
+        id,
+        MAX(title) AS title,
+        MAX(abstract) AS abstract,
+        MAX(year) AS year,
+        NORMALIZE(
             ARRAY_JOIN(
                 ARRAY_AGG(paragraph), chr(13) || chr(13)
-            ) AS full_text,
-            -- make 30 partitions for smaller output files
-            floor(rand() * 30) as part_id
+            )
+        ) AS full_text
     FROM (
         SELECT
             id,
@@ -38,28 +38,33 @@ UNLOAD (
                 ) AS all_paralocs
             FROM (
                 SELECT
-                    id,
-                    metadata.publication_date.year as year,
-                    metadata.title as title,
-                    metadata.abstract as abstract,
+                    spr.id,
+                    spr.metadata.publication_date.year as year,
+                    spr.metadata.title as title,
+                    spr.metadata.abstract as abstract,
                     CAST (
-                        json_parse(metadata.fields_of_study) AS array(varchar)
+                        json_parse(spr.metadata.fields_of_study) AS array(varchar)
                     ) AS fields_of_study,
-                    content.grobid.contents as full_text,
+                    spr.content.grobid.contents as full_text,
                     CAST(
-                        json_parse(content.grobid.annotations.paragraph)
+                        json_parse(spr.content.grobid.annotations.paragraph)
                         AS array(json)
                     ) || CAST(
-                        json_parse(content.grobid.annotations.section_header)
+                        json_parse(spr.content.grobid.annotations.section_header)
                         AS array(json)
                     ) AS all_paralocs
-                FROM s2orc_papers.releases
+                FROM (
+                    SELECT corpus_paper_id as id
+                    FROM content_ext.paper_sources
+                    WHERE source = 'ACL'
+                ) AS corpus_ext
+                INNER JOIN s2orc_papers.releases AS spr
+                    ON spr.id = corpus_ext.id
                 WHERE
                     year=2022 AND
                     month=12 AND
                     day=11 AND
                     metadata.fields_of_study IS NOT NULL
-                    LIMIT 10
             )
             WHERE CONTAINS(fields_of_study, 'Computer Science')
         )
@@ -67,9 +72,8 @@ UNLOAD (
     )
     GROUP BY id
 )
-TO 's3://ai2-s2-lucas/s2orc_20221211/cs_content/'
+TO 's3://ai2-s2-lucas/s2orc_20221211/acl_s2orc/'
 WITH (
     format='JSON',
-    compression='GZIP',
-    partitioned_by = ARRAY['part_id']
+    compression='GZIP'
 )

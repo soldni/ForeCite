@@ -1,14 +1,16 @@
 UNLOAD (
     SELECT
-            id,
-            MAX(title) as title,
-            MAX(abstract) as abstract,
-            MAX(year) as year,
+        id,
+        MAX(title) as title,
+        MAX(abstract) as abstract,
+        MAX(year) as year,
+        NORMALIZE(
             ARRAY_JOIN(
                 ARRAY_AGG(paragraph), chr(13) || chr(13)
-            ) AS full_text,
-            -- make 30 partitions for smaller output files
-            floor(rand() * 30) as part_id
+            )
+        ) AS full_text,
+        -- make 30 partitions for smaller output files
+        floor(rand() * 30) as part_id
     FROM (
         SELECT
             id,
