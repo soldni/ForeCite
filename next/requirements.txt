@@ -4,3 +4,4 @@ fsspec>=2022.11.0
 textacy
 spacy
 cached_path
+necessary
