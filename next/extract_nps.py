@@ -17,6 +17,7 @@ from necessary import necessary
 from textacy.extract.basics import noun_chunks as textacy_noun_chunks
 
 from .io_utils import read_file, write_file, recursively_list_files
+from .mp_utils import Reduce, Map
 
 
 class NounChunkExtractor:
@@ -144,6 +145,14 @@ class Config:
     freq: int = 3
 
 
+
+def merge_vocabs(*vocabs: Counter[str]):
+    first, *rest = vocabs
+    for v in rest:
+        first.update(v)
+    return first
+
+
 @sp.cli(Config)
 def main(cfg: Config):
     '''
@@ -161,15 +170,11 @@ def main(cfg: Config):
     # get file system depending on protocol in the prefix
     sources = list(recursively_list_files(cfg.prefix))
 
-    if cfg.debug:
-        part_vocabs = [process_single(path=path, cfg=cfg) for path in sources]
-    else:
-        with multiprocessing.Pool(cfg.n_proc) as pool:
-            part_vocabs = pool.map(partial(process_single, cfg=cfg), sources)
+    map_pool = Map(n_proc=cfg.n_proc, debug=cfg.debug)
+    part_vocabs = map_pool(process_single, sources, cfg=cfg)
 
-    vocab: Counter[str] = Counter()
-    for part_vocab in part_vocabs:
-        vocab.update(part_vocab)
+    reduce_pool = Reduce(n_proc=cfg.n_proc, debug=cfg.debug)
+    vocab = reduce_pool(merge_vocabs, part_vocabs)
 
     with write_file(os.path.join(cfg.output, 'vocab.txt'), 'w') as f:
         for word, count in vocab.most_common():
