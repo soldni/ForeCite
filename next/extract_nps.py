@@ -152,10 +152,14 @@ def main(cfg: Config):
     # get file system depending on protocol in the prefix
     sources = list(recursively_list_files(cfg.prefix))
 
-    map_pool = Map(n_proc=cfg.n_proc, debug=cfg.debug, pbar='Running spacy...')
+    map_pool = Map(
+        n_proc=cfg.n_proc, debug=cfg.debug, pbar='Running spacy...'
+    )
     part_vocabs = map_pool(process_single, sources, cfg=cfg)
 
-    reduce_pool = Reduce(n_proc=cfg.n_proc, debug=cfg.debug, pbar='Merging vocab...')
+    reduce_pool = Reduce(
+        n_proc=cfg.n_proc, debug=cfg.debug, pbar='Merging vocab...'
+    )
     vocab = reduce_pool(merge_vocabs, part_vocabs)
 
     with write_file(os.path.join(cfg.output, 'vocab.txt'), 'w') as f:
