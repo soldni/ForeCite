@@ -5,10 +5,12 @@ from .io_utils import read_file, write_file, recursively_list_files
 from cached_path import cached_path
 
 
-def load_vocab(path: str):
+def load_vocab(path: str) -> dict[str, int]:
     with read_file(cached_path(path)) as f:     # pyright: ignore
-        for ln in f:
-            ...
+        vocab = {t.strip().split('\t')[0]: i for i, t in enumerate(f)}
+    return vocab
+
+
 
 
 @sp.dataclass

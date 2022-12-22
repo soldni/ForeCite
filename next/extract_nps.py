@@ -5,12 +5,10 @@ import json
 import gzip
 import os
 from string import punctuation
-from functools import partial
 from typing import Sequence, Optional, Iterable, Union, Set
 
 import springs as sp
 from cached_path import cached_path
-from tqdm import tqdm
 import spacy
 from spacy.tokens import Span
 from necessary import necessary
@@ -29,8 +27,6 @@ class NounChunkExtractor:
         spacy_disable: Optional[Sequence[str]] = None,
         return_lemma: bool = False,
         return_lower: bool = True,
-        pbar_name: str = 'NounChunkExtractor',
-        pbar_pos: int = 0,
     ):
         with necessary(
             modules='en_core_web_sm',
@@ -44,9 +40,6 @@ class NounChunkExtractor:
         self.return_lemma = return_lemma
         self.return_lower = return_lower
 
-        self.pbar_name = pbar_name
-        self.pbar_pos = pbar_pos
-
     def get_lemma(self, span: Span) -> str:
         return span.lemma_ if self.return_lemma else span.text
 
@@ -58,12 +51,8 @@ class NounChunkExtractor:
     def __call__(
         self, text: Union[str, Sequence[str]]
     ) -> Iterable[Sequence[str]]:
-        texts_it = tqdm(
-            [text] if isinstance(text, str) else text,
-            desc=self.pbar_name,
-            position=self.pbar_pos
-        )
-        for doc in self.nlp.pipe(texts_it):
+        text = [text] if isinstance(text, str) else text
+        for doc in self.nlp.pipe(text):
             yield [
                 self.get_lower(self.get_lemma(chunk))
                 # for chunk in self.find_chunks(doc)
@@ -94,12 +83,6 @@ def escape_line_breaks(text: str) -> str:
 
 
 def process_single(path: str, cfg: 'Config') -> Counter[str]:
-    if len(pid := multiprocessing.current_process()._identity) > 0:
-        pos = pid[0] - 1
-    else:
-        pos = 0
-
-    name = (_p := os.path.basename(path))[:10] + '...' + _p[-10:]
     (stopwords := get_stopwords()).update(set(punctuation))
 
     ids, years, texts = [], [], []
@@ -119,7 +102,7 @@ def process_single(path: str, cfg: 'Config') -> Counter[str]:
                 ).format(**data).strip()
             )
 
-    nce = NounChunkExtractor(pbar_name=f'Processing {name}', pbar_pos=pos)
+    nce = NounChunkExtractor()
     vocab: Counter[str] = Counter()
 
     out_filepath = os.path.join(cfg.output, 'np', f'{h.hexdigest()}.jsonl')
@@ -143,7 +126,6 @@ class Config:
     n_proc: int = max(multiprocessing.cpu_count() - 1, 1)
     debug: bool = False
     freq: int = 3
-
 
 
 def merge_vocabs(*vocabs: Counter[str]):
@@ -170,10 +152,10 @@ def main(cfg: Config):
     # get file system depending on protocol in the prefix
     sources = list(recursively_list_files(cfg.prefix))
 
-    map_pool = Map(n_proc=cfg.n_proc, debug=cfg.debug)
+    map_pool = Map(n_proc=cfg.n_proc, debug=cfg.debug, pbar='Running spacy...')
     part_vocabs = map_pool(process_single, sources, cfg=cfg)
 
-    reduce_pool = Reduce(n_proc=cfg.n_proc, debug=cfg.debug)
+    reduce_pool = Reduce(n_proc=cfg.n_proc, debug=cfg.debug, pbar='Merging vocab...')
     vocab = reduce_pool(merge_vocabs, part_vocabs)
 
     with write_file(os.path.join(cfg.output, 'vocab.txt'), 'w') as f:

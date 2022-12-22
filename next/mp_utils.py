@@ -1,27 +1,53 @@
-from multiprocessing.managers import ValueProxy
+from multiprocessing.managers import ValueProxy, SyncManager
 from time import sleep
 from functools import partial, reduce
-from typing import Sequence, Tuple, TypeVar, Callable, Iterable, Union
+from typing import (
+    Optional, Sequence, Tuple, TypeVar, Callable, Iterable, Union
+)
 from concurrent.futures import ProcessPoolExecutor, Future
-from multiprocessing import Pool, Manager
 from queue import Queue
 
 from typing_extensions import ParamSpec, Concatenate
+
+from tqdm import tqdm
 
 T = TypeVar('T')
 V = TypeVar('V')
 P = ParamSpec('P')
 
 
+class MpTqdm(tqdm):
+    def set_total(self, value: int) -> None:
+        self.total = value
+
+
 class Map:
-    def __init__(self, n_proc: int = 1, debug: bool = False) -> None:
+    def __init__(
+        self,
+        n_proc: int = 1,
+        debug: bool = False,
+        timeout: Union[int, float] = 0.1,
+        pbar: Optional[str] = None
+    ) -> None:
+        self.timeout = float(timeout)
         self.n_proc = n_proc
+        self.pbar = pbar
         self.debug = debug
+
+    @staticmethod
+    def _when_completed(
+        _: Future,
+        pbar: Union[tqdm, None],
+        count: ValueProxy
+    ):
+        count.value -= 1
+        if pbar is not None:
+            pbar.update(1)
 
     def __call__(
         self,
         fn: Callable[Concatenate[T, P], V],
-        seq: Iterable[T],
+        seq: Sequence[T],
         *_: P.args,
         **kwargs: P.kwargs
     ) -> Sequence[V]:
@@ -29,8 +55,40 @@ class Map:
             _fn = partial(fn, **kwargs)
             return [_fn(x) for x in seq]
         else:
-            with Pool(self.n_proc) as p:
-                return p.map(partial(fn, **kwargs), seq)
+
+            SyncManager.register('MpTqdm', MpTqdm)
+
+            with ProcessPoolExecutor(self.n_proc) as pool, \
+                    SyncManager() as manager:
+
+                count = manager.Value('i', 0)
+                pbar: Optional[MpTqdm] = (
+                    manager.MpTqdm(total=0, desc=self.pbar)  # type: ignore
+                    if self.pbar else None
+                )
+
+                response = []
+                for elem in seq:
+                    count.value += 1
+                    if pbar is not None:
+                        pbar.set_total(count.value)
+
+                    response.append(
+                        f := pool.submit(partial(fn, **kwargs), elem)
+                    )
+                    f.add_done_callback(
+                        partial(self._when_completed, pbar=pbar, count=count)
+                    )
+
+                if pbar:
+                    pbar.refresh()
+
+                while count.value > 0:
+                    sleep(self.timeout)
+
+                if pbar:
+                    pbar.close()
+                return [f.result() for f in response]
 
 
 class Reduce:
@@ -38,7 +96,8 @@ class Reduce:
         self,
         n_proc: int = 1,
         debug: bool = False,
-        timeout: Union[int, float] = 0.1
+        timeout: Union[int, float] = 0.1,
+        pbar: Optional[str] = None,
     ) -> None:
         """This is a parallel implementation of the reduce function. It
         works by recursively calling a function on pairs of elements in
@@ -58,6 +117,7 @@ class Reduce:
         self.n_proc = n_proc
         self.debug = debug
         self.timeout = float(timeout)
+        self.pbar = pbar
 
     def _partition_queue(self, queue: Queue[T]) -> Iterable[Tuple[T, T]]:
         # keep first element of each pair to yield here until we have popped
@@ -83,11 +143,14 @@ class Reduce:
     def _when_completed(
         future: Future,
         queue: Queue,
-        steps: ValueProxy[int]
+        steps: ValueProxy[int],
+        pbar: Optional[tqdm] = None,
     ) -> None:
         # completed the operation, so we can decrement the number of steps
         # and put the result back in the queue
         queue.put(future.result())
+        if pbar:
+            pbar.update(1)
         steps.value -= 1
 
     def _num_steps(self, n: int) -> int:
@@ -108,8 +171,9 @@ class Reduce:
         if self.n_proc == 1 or self.debug:
             return reduce(partial(fn, **kwargs), seq)
         else:
+            SyncManager.register('tqdm', tqdm)
             with ProcessPoolExecutor(self.n_proc) as pool, \
-                    Manager() as manager:
+                    SyncManager() as manager:
 
                 # populate the queue with the elements of the sequence
                 queue: Queue[T] = manager.Queue()
@@ -121,6 +185,12 @@ class Reduce:
                 # in a separate process. `i` is the type code for an
                 # integer.
                 steps = manager.Value('i', self._num_steps(queue.qsize()))
+
+                pbar: Optional[tqdm] = (
+                    manager.tqdm(   # type: ignore
+                        desc=self.pbar, total=steps.value
+                    ) if self.pbar is not None else None
+                )
 
                 while steps.value > 0:
                     if queue.empty():
@@ -139,30 +209,36 @@ class Reduce:
                             partial(
                                 self._when_completed,
                                 queue=queue,
-                                steps=steps
+                                steps=steps,
+                                pbar=pbar
                             )
                         )
+
+                if pbar:
+                    pbar.close()
 
                 return queue.get()
 
 
-# def f(x, y):
-#     return x + y
+def f(x, y):
+    sleep(.1)
+    return x + y
 
 
-# def g(x, y: int = 0):
-#     return x * 2 + y
+def g(x, y: int = 0):
+    sleep(.1)
+    return x * 2 + y
 
 
-# if __name__ == '__main__':
+if __name__ == '__main__':
 
-#     r = Reduce(n_proc=10, debug=False)
-#     o = r(f, range(10))
-#     print(o)
+    r = Reduce(n_proc=4, debug=False, pbar='reduce')
+    o = r(f, range(10))
+    print(o)
 
-#     m = Map(n_proc=10, debug=False)
-#     o = m(g, range(10))
-#     print(o)
+    m = Map(n_proc=10, debug=False, pbar='map')
+    o = m(g, range(10))
+    print(o)
 
-#     o = r(f, m(g, range(10), y=1))
-#     print(o)
+    o = r(f, m(g, range(10), y=1))
+    print(o)
