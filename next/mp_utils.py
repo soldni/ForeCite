@@ -1,10 +1,13 @@
+from contextlib import ExitStack
+from multiprocessing import Process
+from threading import Semaphore
 from multiprocessing.managers import ValueProxy, SyncManager
 from time import sleep
 from functools import partial, reduce
 from typing import (
-    Optional, Sequence, Tuple, TypeVar, Callable, Iterable, Union
+    Generic, Optional, Sequence, Tuple, TypeVar, Callable, Iterable, Union
 )
-from concurrent.futures import ProcessPoolExecutor, Future
+from concurrent.futures import ProcessPoolExecutor, Future, ThreadPoolExecutor
 from queue import Queue
 
 from typing_extensions import ParamSpec, Concatenate
@@ -14,6 +17,7 @@ from tqdm import tqdm
 T = TypeVar('T')
 V = TypeVar('V')
 P = ParamSpec('P')
+MAX_INT = 2147483647
 
 
 class MpTqdm(tqdm):
@@ -220,25 +224,195 @@ class Reduce:
                 return queue.get()
 
 
-def f(x, y):
-    sleep(.1)
-    return x + y
+class Bag(Generic[T]):
+    def __init__(
+        self,
+        n_proc: int = 0,
+        manager: Optional[SyncManager] = None,
+        callback_if_success: Optional[Callable] = None,
+        callback_if_failure: Optional[Callable] = None,
+        timeout: Union[int, float] = 1.0,
+        error_msg: str = 'Process failed',
+    ) -> None:
+        self.stack = ExitStack()
+        if not manager:
+            manager = self.stack.enter_context(SyncManager())
+        self.manager = manager
+        self.semaphore = self.manager.Semaphore(
+            n_proc if n_proc > 0 else MAX_INT
+        )
+        self.output = self.manager.Queue()
+        self.n_proc = n_proc
+        self.processes: list[Process] = []
+        self.callback_if_success = callback_if_success or self._null_fn
+        self.callback_if_failure = callback_if_failure or self._null_fn
+        self.started = False
+        self.timeout = float(timeout)
+        self.error_msg = error_msg
+
+    def __enter__(self) -> 'Bag':
+        return self
+
+    @staticmethod
+    def _null_fn() -> None:
+        pass
+
+    @staticmethod
+    def _semaphore_wrapper(
+        *args,
+        fn: Callable[..., T],
+        semaphore: Semaphore,
+        output: Queue[T],
+        **kwargs
+    ):
+        with semaphore:
+            result = fn(*args, **kwargs)
+            output.put(result)
+
+    def add(self, target: Callable[..., T], *args, **kwargs) -> None:
+        if self.started:
+            raise RuntimeError('Collection has already been started')
+
+        wrapped = partial(
+            self._semaphore_wrapper,
+            fn=target,
+            semaphore=self.semaphore,
+            output=self.output,
+        )
+        p = Process(target=wrapped, *args, **kwargs)    # type: ignore
+        self.processes.append(p)
+
+    @staticmethod
+    def _monitor(
+        processes: list[Process],
+        timeout: float,
+        error_msg: str,
+        output: Queue,
+        callback_if_success: Callable,
+        callback_if_failure: Callable,
+    ):
+        keep_pooling = True
+
+        while keep_pooling:
+            keep_pooling = False
+
+            for p in processes:
+                if p.exitcode == 1:
+                    for p in processes:
+                        p.terminate()
+                    callback_if_failure()
+                    raise RuntimeError(error_msg)
+                if p.is_alive():
+                    keep_pooling = True
+
+            sleep(timeout)
+
+        callback_if_success()
+
+        for p in processes:
+            p.join()
+
+    def results(self) -> list[T]:
+        while any(p.is_alive() for p in self.processes):
+            sleep(self.timeout)
+        return [self.output.get() for _ in self.processes]
+
+    def start(self, block: bool = True):
+        if self.started:
+            raise RuntimeError('Collection has already been started')
+
+        self.started = True
+        for p in self.processes:
+            p.start()
+
+        monitor = partial(
+            self._monitor,
+            processes=self.processes,
+            timeout=self.timeout,
+            error_msg=self.error_msg,
+            output=self.output,
+            callback_if_success=self.callback_if_success,
+            callback_if_failure=self.callback_if_failure,
+        )
+
+        if block:
+            monitor()
+        else:
+            self.stack.enter_context(ThreadPoolExecutor(1)).submit(monitor)
+
+    def __exit__(self, *args) -> None:
+        self.stack.close()
 
 
-def g(x, y: int = 0):
-    sleep(.1)
-    return x * 2 + y
+def monitor_processes(
+    processes: Sequence[Process],
+    callback_if_success: Optional[Callable] = None,
+    callback_if_failed: Optional[Callable] = None,
+    timeout: Union[int, float] = 1,
+    error_msg: str = 'Child process failed'
+) -> None:
+    timeout = float(timeout)
+    keep_pooling = True
+    while keep_pooling:
+        keep_pooling = False
+        for p in processes:
+            if p.exitcode == 1:
+                for p in processes:
+                    p.terminate()
+                if callback_if_failed:
+                    callback_if_failed()
+                raise RuntimeError(error_msg)
+
+            if p.is_alive():
+                keep_pooling = True
+        sleep(timeout)
+
+    if callback_if_success:
+        callback_if_success()
+
+    for p in processes:
+        p.join()
 
 
-if __name__ == '__main__':
+# def f(x, y):
+#     sleep(.1)
+#     return x + y
 
-    r = Reduce(n_proc=4, debug=False, pbar='reduce')
-    o = r(f, range(10))
-    print(o)
 
-    m = Map(n_proc=10, debug=False, pbar='map')
-    o = m(g, range(10))
-    print(o)
+# def g(x, y: int = 0):
+#     sleep(.1)
+#     return x * 2 + y
 
-    o = r(f, m(g, range(10), y=1))
-    print(o)
+
+# def h(x):
+#     sleep(.1)
+#     print(f'step: {x}')
+#     return x
+
+
+# if __name__ == '__main__':
+#     r = Reduce(n_proc=4, debug=False, pbar='reduce')
+#     o = r(f, range(10))
+#     print(o)
+
+#     m = Map(n_proc=10, debug=False, pbar='map')
+#     o = m(g, range(10))
+#     print(o)
+
+#     o = r(f, m(g, range(10), y=1))
+#     print(o)
+
+#     with Bag(n_proc=1, timeout=.1) as b:
+#         for i in range(10):
+#             b.add(target=h, args=(i,))
+#         b.start()
+#         o = b.results()
+#         print(f'result: {o}')
+
+#     with Bag(n_proc=0, timeout=3) as b:
+#         for i in range(10):
+#             b.add(target=h, args=(i,))
+#         b.start(block=False)
+#         print('waiting for results')
+#         o = b.results()
+#         print(f'result: {o}')
