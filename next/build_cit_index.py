@@ -1,29 +1,34 @@
 import bisect
+import json
+import os
 from contextlib import ExitStack, contextmanager
 from curses.ascii import isascii
-import json
-from multiprocessing import Manager, cpu_count, Process
-from threading import Semaphore
+from multiprocessing import Manager, Process, cpu_count
 from queue import Queue
-import os
+from threading import Semaphore
 from time import sleep
-from typing import Callable, Tuple, Union
+from typing import Callable, NamedTuple, Tuple, Union
 
 import ftfy
-
+import springs as sp
 from typing_extensions import Concatenate, ParamSpec
 
-import springs as sp
-from .io_utils import read_file, write_file, recursively_list_files
-from .mp_utils import monitor_processes, Bag
+from .io_utils import read_file, recursively_list_files, write_file
+from .mp_utils import Bag, monitor_processes
+
+LOGGER = sp.configure_logging(__name__, logging_level="INFO")
 
 
-LOGGER = sp.configure_logging(__name__, logging_level='INFO')
+class CitationEdgeTuple(NamedTuple):
+    citing: int
+    cited: int
+    year: int
 
 
 class EOP:
-    '''End of processing sentinel value; after this value is popped from
-    a queue, a worker should stop.'''
+    """End of processing sentinel value; after this value is popped from
+    a queue, a worker should stop."""
+
     def __init__(self, success: bool):
         self.success = success
 
@@ -36,9 +41,9 @@ def paper_to_citation_index_worker(
     citations_queue: Queue[Union[Tuple[int, int, int], EOP]],
     dest: str,
     timeout: float = 1.0,
-    partition_fn: Callable[[int], str] = partition_by_paper
+    partition_fn: Callable[[int], str] = partition_by_paper,
 ):
-    '''
+    """
     Worker that builds the paper to citation index.
 
     The citations_queue should be a queue of tuples of the form
@@ -58,10 +63,9 @@ def paper_to_citation_index_worker(
         partition_fn (Callable[[int], str], optional): Function that
             partitions papers into groups. Defaults to partitioning by
             the first two numbers of the paper_id.
-    '''
+    """
     logger = sp.configure_logging(
-        logger_name='term_to_paper_index_worker',
-        logging_level='INFO'
+        logger_name="term_to_paper_index_worker", logging_level="INFO"
     )
 
     paper_cit_index: dict[str, dict[int, dict[int, list[int]]]] = {}
@@ -77,7 +81,7 @@ def paper_to_citation_index_worker(
             if pc.success:
                 break
             else:
-                raise RuntimeError('Error processing citations queue')
+                raise RuntimeError("Error processing citations queue")
 
         paper_id, cited_paper_id, year = pc
         key = partition_fn(paper_id)
@@ -87,37 +91,40 @@ def paper_to_citation_index_worker(
         ).setdefault(year, [])
         p[year].append(cited_paper_id)
 
-    logger.info('Finished processing queue; writing files...')
+    logger.info("Finished processing queue; writing files...")
     for key, papers in paper_cit_index.items():
-        path = os.path.join(dest, 'paper_citations', f'{key}.jsonl')
+        path = os.path.join(dest, "paper_citations", f"{key}.jsonl")
         with write_file(path, skip_if_empty=True) as f:
             for pid, y in papers.items():
-                f.write(json.dumps(dict(paper=pid, years=y)) + '\n')
+                f.write(json.dumps(dict(paper=pid, years=y)) + "\n")
 
-        logger.info(f'Wrote {path} ({len(papers)} papers)')
+        logger.info(f"Wrote {path} ({len(papers)} papers)")
 
 
 def process_cit_file(
-    path: str,
-    citations_queue: Queue[Union[Tuple[int, int, int], EOP]]
+    path: str, citations_queue: Queue[Union[CitationEdgeTuple, EOP]]
 ):
     logger = sp.configure_logging(
-        logger_name='process_cit_file',
-        logging_level='INFO'
+        logger_name="process_cit_file", logging_level="INFO"
     )
 
-    logger.info(f'Processing {path}...')
-    with read_file(path) as f:
+    logger.info(f"Processing {path}...")
+    with read_file(path, mode="rb") as f:
         for line in f:
-            cit = json.loads(line)
-            for c in cit['cited']:
-                citations_queue.put((cit['paper'], cit['cited'], cit['year']))
+            citations = json.loads(line)
+            for citation in citations["cited"]:
+                edge = CitationEdgeTuple(
+                    citing=citations["paper"],
+                    cited=citation,
+                    year=citations["year"],
+                )
+                citations_queue.put(edge)
 
 
 @sp.dataclass
 class BuildCitationIndicesConfig:
-    prefix: str = 's3://ai2-s2-lucas/s2orc_20221211/edge_graph/'
-    dest: str = 's3://ai2-s2-lucas/s2orc_20221211/acl_forecite_indices/'
+    src: str = "s3://ai2-s2-lucas/s2orc_20221211/edge_graph_sorted/"
+    dst: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_forecite_indices/"
     n_proc: int = max(cpu_count() - 1, 2)
     min_papers: int = 3
 
@@ -150,10 +157,10 @@ def main(cfg: BuildCitationIndicesConfig):
         - for each paper p, the list of papers that cite p, grouped by year
     """
 
-    assert cfg.n_proc > 1, 'Must have at least two processes assigned'
+    assert cfg.n_proc > 1, "Must have at least two processes assigned"
 
     # these are the files to process
-    np_files = recursively_list_files(cfg.prefix)
+    np_files = recursively_list_files(cfg.src)
 
     with Manager() as m:
         terms_queue = m.Queue()
@@ -166,28 +173,28 @@ def main(cfg: BuildCitationIndicesConfig):
             manager=m,
             callback_if_success=lambda: terms_queue.put(EOP(True)),
             callback_if_failure=lambda: terms_queue.put(EOP(False)),
-            error_msg='One of the reader processes failed'
+            error_msg="One of the reader processes failed",
         ) as readers_bag, Bag(
             # one lone core for the writer
             n_proc=1,
             # again, we need to share the manager for the terms queue
             manager=m,
-            error_msg='Writer process failed'
+            error_msg="Writer process failed",
         ) as writer_bag:
 
             writer_bag.add(
                 target=term_to_paper_index_worker,
                 kwargs=dict(
                     terms_queue=terms_queue,
-                    dest=cfg.dest,
-                    min_papers=cfg.min_papers
-                )
+                    dest=cfg.dst,
+                    min_papers=cfg.min_papers,
+                ),
             )
 
             for f in np_files:
                 readers_bag.add(
                     target=process_nps_file,
-                    kwargs=dict(path=f, terms_queue=terms_queue)
+                    kwargs=dict(path=f, terms_queue=terms_queue),
                 )
 
             # we don't care about blocking on a successful read, but
@@ -196,5 +203,5 @@ def main(cfg: BuildCitationIndicesConfig):
             writer_bag.start(block=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

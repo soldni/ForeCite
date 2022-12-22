@@ -1,22 +1,29 @@
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import ExitStack
-from multiprocessing import Process
-from threading import Semaphore
-from multiprocessing.managers import ValueProxy, SyncManager
-from time import sleep
 from functools import partial, reduce
-from typing import (
-    Generic, Optional, Sequence, Tuple, TypeVar, Callable, Iterable, Union
-)
-from concurrent.futures import ProcessPoolExecutor, Future, ThreadPoolExecutor
+from multiprocessing import Process
+from multiprocessing.managers import SyncManager, ValueProxy
 from queue import Queue
-
-from typing_extensions import ParamSpec, Concatenate
+from threading import Semaphore
+from time import sleep
+from typing import (
+    Callable,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 from tqdm import tqdm
+from typing_extensions import Concatenate, ParamSpec
 
-T = TypeVar('T')
-V = TypeVar('V')
-P = ParamSpec('P')
+T = TypeVar("T")
+V = TypeVar("V")
+P = ParamSpec("P")
 MAX_INT = 2147483647
 
 
@@ -31,7 +38,7 @@ class Map:
         n_proc: int = 1,
         debug: bool = False,
         timeout: Union[int, float] = 0.1,
-        pbar: Optional[str] = None
+        pbar: Optional[str] = None,
     ) -> None:
         self.timeout = float(timeout)
         self.n_proc = n_proc
@@ -39,11 +46,7 @@ class Map:
         self.debug = debug
 
     @staticmethod
-    def _when_completed(
-        _: Future,
-        pbar: Union[tqdm, None],
-        count: ValueProxy
-    ):
+    def _when_completed(_: Future, pbar: Union[tqdm, None], count: ValueProxy):
         count.value -= 1
         if pbar is not None:
             pbar.update(1)
@@ -53,22 +56,24 @@ class Map:
         fn: Callable[Concatenate[T, P], V],
         seq: Sequence[T],
         *_: P.args,
-        **kwargs: P.kwargs
+        **kwargs: P.kwargs,
     ) -> Sequence[V]:
         if self.n_proc == 1 or self.debug:
             _fn = partial(fn, **kwargs)
             return [_fn(x) for x in seq]
         else:
 
-            SyncManager.register('MpTqdm', MpTqdm)
+            SyncManager.register("MpTqdm", MpTqdm)
 
-            with ProcessPoolExecutor(self.n_proc) as pool, \
-                    SyncManager() as manager:
+            with ProcessPoolExecutor(
+                self.n_proc
+            ) as pool, SyncManager() as manager:
 
-                count = manager.Value('i', 0)
+                count = manager.Value("i", 0)
                 pbar: Optional[MpTqdm] = (
                     manager.MpTqdm(total=0, desc=self.pbar)  # type: ignore
-                    if self.pbar else None
+                    if self.pbar
+                    else None
                 )
 
                 response = []
@@ -169,15 +174,16 @@ class Reduce:
         fn: Callable[Concatenate[T, T, P], T],
         seq: Sequence[T],
         *_: P.args,
-        **kwargs: P.kwargs
+        **kwargs: P.kwargs,
     ) -> T:
 
         if self.n_proc == 1 or self.debug:
             return reduce(partial(fn, **kwargs), seq)
         else:
-            SyncManager.register('tqdm', tqdm)
-            with ProcessPoolExecutor(self.n_proc) as pool, \
-                    SyncManager() as manager:
+            SyncManager.register("tqdm", tqdm)
+            with ProcessPoolExecutor(
+                self.n_proc
+            ) as pool, SyncManager() as manager:
 
                 # populate the queue with the elements of the sequence
                 queue: Queue[T] = manager.Queue()
@@ -188,12 +194,14 @@ class Reduce:
                 # so that we can access it from the callback function
                 # in a separate process. `i` is the type code for an
                 # integer.
-                steps = manager.Value('i', self._num_steps(queue.qsize()))
+                steps = manager.Value("i", self._num_steps(queue.qsize()))
 
                 pbar: Optional[tqdm] = (
-                    manager.tqdm(   # type: ignore
+                    manager.tqdm(  # type: ignore
                         desc=self.pbar, total=steps.value
-                    ) if self.pbar is not None else None
+                    )
+                    if self.pbar is not None
+                    else None
                 )
 
                 while steps.value > 0:
@@ -214,7 +222,7 @@ class Reduce:
                                 self._when_completed,
                                 queue=queue,
                                 steps=steps,
-                                pbar=pbar
+                                pbar=pbar,
                             )
                         )
 
@@ -232,7 +240,7 @@ class Bag(Generic[T]):
         callback_if_success: Optional[Callable] = None,
         callback_if_failure: Optional[Callable] = None,
         timeout: Union[int, float] = 1.0,
-        error_msg: str = 'Process failed',
+        error_msg: str = "Process failed",
     ) -> None:
         self.stack = ExitStack()
         if not manager:
@@ -243,14 +251,14 @@ class Bag(Generic[T]):
         )
         self.output = self.manager.Queue()
         self.n_proc = n_proc
-        self.processes: list[Process] = []
+        self.processes: List[Process] = []
         self.callback_if_success = callback_if_success or self._null_fn
         self.callback_if_failure = callback_if_failure or self._null_fn
         self.started = False
         self.timeout = float(timeout)
         self.error_msg = error_msg
 
-    def __enter__(self) -> 'Bag':
+    def __enter__(self) -> "Bag":
         return self
 
     @staticmethod
@@ -263,7 +271,7 @@ class Bag(Generic[T]):
         fn: Callable[..., T],
         semaphore: Semaphore,
         output: Queue[T],
-        **kwargs
+        **kwargs,
     ):
         with semaphore:
             result = fn(*args, **kwargs)
@@ -271,7 +279,7 @@ class Bag(Generic[T]):
 
     def add(self, target: Callable[..., T], *args, **kwargs) -> None:
         if self.started:
-            raise RuntimeError('Collection has already been started')
+            raise RuntimeError("Collection has already been started")
 
         wrapped = partial(
             self._semaphore_wrapper,
@@ -279,12 +287,12 @@ class Bag(Generic[T]):
             semaphore=self.semaphore,
             output=self.output,
         )
-        p = Process(target=wrapped, *args, **kwargs)    # type: ignore
+        p = Process(target=wrapped, *args, **kwargs)  # type: ignore
         self.processes.append(p)
 
     @staticmethod
     def _monitor(
-        processes: list[Process],
+        processes: List[Process],
         timeout: float,
         error_msg: str,
         output: Queue,
@@ -312,14 +320,14 @@ class Bag(Generic[T]):
         for p in processes:
             p.join()
 
-    def results(self) -> list[T]:
+    def results(self) -> List[T]:
         while any(p.is_alive() for p in self.processes):
             sleep(self.timeout)
         return [self.output.get() for _ in self.processes]
 
     def start(self, block: bool = True):
         if self.started:
-            raise RuntimeError('Collection has already been started')
+            raise RuntimeError("Collection has already been started")
 
         self.started = True
         for p in self.processes:
@@ -349,7 +357,7 @@ def monitor_processes(
     callback_if_success: Optional[Callable] = None,
     callback_if_failed: Optional[Callable] = None,
     timeout: Union[int, float] = 1,
-    error_msg: str = 'Child process failed'
+    error_msg: str = "Child process failed",
 ) -> None:
     timeout = float(timeout)
     keep_pooling = True

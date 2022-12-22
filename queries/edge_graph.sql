@@ -9,7 +9,8 @@ UNLOAD (
     SELECT
         id,
         year,
-        array_agg(CAST(cited AS bigint)) AS cited
+        ARRAY_SORT(ARRAY_AGG(CAST(cited AS bigint))) AS cited,
+        floor(rand() * 30) as part_id
     FROM (
         SELECT
             id,
@@ -30,5 +31,9 @@ UNLOAD (
     WHERE cited is not NULL
     GROUP BY id, year
 )
-TO 's3://ai2-s2-lucas/s2orc_20221211/edge_graph/'
-WITH (format='JSON', compression='GZIP')
+TO 's3://ai2-s2-lucas/s2orc_20221211/edge_graph_sorted/'
+WITH (
+    format='JSON',
+    compression='GZIP',
+    partitioned_by = ARRAY['part_id']
+)
