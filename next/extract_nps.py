@@ -4,8 +4,9 @@ import json
 import multiprocessing
 import os
 from collections import Counter
+import re
 from string import punctuation
-from typing import Counter as CounterType
+from typing import Counter as CounterType, cast
 from typing import Iterable, Optional, Sequence, Set, Union
 
 import spacy
@@ -14,6 +15,7 @@ from cached_path import cached_path
 from necessary import necessary
 from spacy.tokens import Span
 from textacy.extract.basics import noun_chunks as textacy_noun_chunks
+from ftfy import fix_text
 
 from .io_utils import read_file, recursively_list_files, write_file
 from .mp_utils import Map, Reduce
@@ -40,6 +42,52 @@ class NounChunkExtractor:
 
         self.return_lemma = return_lemma
         self.return_lower = return_lower
+        self.leading_digits_re = re.compile(r"^[\d,\.]+\b")
+        self.stopwords = self.get_stopwords()
+        self.punctuation = set(punctuation)
+
+    @staticmethod
+    def get_stopwords(
+        url: str = (
+            "https://ai2-s2-research-public.s3-us-west-2.amazonaws.com/"
+            "lucas/Alir3z4-stop-words-6dedf5e/english.txt"
+        ),
+    ) -> Set[str]:
+
+        with open(cached_path(url), "r") as f:
+            stopwords = set(f.read().splitlines())
+        stopwords.update({
+            'table', 'tables', 'tab', 'tab.', 'tabs', 'tabs.',
+            'figure', 'figures', 'fig', 'fig.', 'figs', 'figs.'
+        })
+        return stopwords
+
+    def process_chunk(self, chunk: Span) -> Union[str, None]:
+        if (chunk.end_char - chunk.start_char) < 3 or len(chunk) >= 10:
+            return None
+
+        if self.leading_digits_re.match(chunk[0].text):
+            # first token is a number
+            return None
+
+        text = chunk.lemma_ if self.return_lemma else chunk.text
+        text = text.lower() if self.return_lower else text
+
+        if text in self.stopwords:
+            # full chunk is a stopword
+            return None
+
+        if text[0] in self.punctuation:
+            # first character is punctuation
+            return None
+
+        if text.startswith('http://') or text.startswith('https://'):
+            # is a URL
+            return None
+
+        text = fix_text(text)
+
+        return text
 
     def get_lemma(self, span: Span) -> str:
         return span.lemma_ if self.return_lemma else span.text
@@ -49,14 +97,15 @@ class NounChunkExtractor:
 
     def __call__(
         self, text: Union[str, Sequence[str]]
-    ) -> Iterable[Sequence[str]]:
+    ) -> Iterable[Set[str]]:
         text = [text] if isinstance(text, str) else text
         for doc in self.nlp.pipe(text):
-            yield [
-                self.get_lower(self.get_lemma(chunk))
-                # for chunk in self.find_chunks(doc)
+            chunks = set(
+                self.process_chunk(chunk)
                 for chunk in textacy_noun_chunks(doc, drop_determiners=True)
-            ]
+            )
+            chunks.discard(None)
+            yield cast(Set[str], chunks)
 
 
 def get_stopwords(
@@ -82,8 +131,6 @@ def escape_line_breaks(text: str) -> str:
 
 
 def process_single(path: str, cfg: "Config") -> CounterType[str]:
-    (stopwords := get_stopwords()).update(set(punctuation))
-
     ids, years, texts = [], [], []
 
     h = hashlib.md5()
@@ -108,7 +155,7 @@ def process_single(path: str, cfg: "Config") -> CounterType[str]:
 
     with write_file(out_filepath) as f:
         for id_, year, nc in zip(ids, years, nce(texts)):
-            nc_dict = Counter(w for w in nc if w not in stopwords)
+            nc_dict = Counter(w for w in nc)
             vocab.update(nc_dict)
             f.write(
                 json.dumps(
