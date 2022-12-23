@@ -94,10 +94,7 @@ def term_to_paper_index_worker(
     term_papers_index: Dict[str, Dict[str, List[int]]] = {}
     term_years_index: Dict[str, Dict[str, Dict[int, int]]] = {}
 
-    pbar = tqdm(
-        unit_scale=True,
-        unit=' noun chunks'
-    )
+    pbar = tqdm(unit_scale=True, unit=" noun chunks")
 
     while True:
         if terms_queue.empty():
@@ -108,7 +105,7 @@ def term_to_paper_index_worker(
 
         if pbar.n % 100 == 0:
             qsize = terms_queue.qsize()
-            pbar.set_description(f'Processing terms (~{qsize:,} in queue)')
+            pbar.set_description(f"Processing terms (~{qsize:,} in queue)")
 
         if isinstance(ncs, EOP):
             break
@@ -129,8 +126,8 @@ def term_to_paper_index_worker(
     for key, terms in tqdm(
         term_papers_index.items(),
         total=len(term_papers_index),
-        desc='Writing term/papers index files',
-        unit=' part',
+        desc="Writing term/papers index files",
+        unit=" part",
     ):
         path = os.path.join(dest, "term_papers", f"{key}.jsonl")
         with write_file(path, skip_if_empty=True, logger=logger) as f:
@@ -142,8 +139,8 @@ def term_to_paper_index_worker(
     for key, terms in tqdm(
         term_years_index.items(),
         total=len(term_years_index),
-        desc='Writing term/years index files',
-        unit=' part',
+        desc="Writing term/years index files",
+        unit=" part",
     ):
         path = os.path.join(dest, "term_years", f"{key}.jsonl")
         with write_file(path, skip_if_empty=True, logger=logger) as f:
@@ -269,5 +266,5 @@ def main(cfg: BuildNpsIndicesConfig):
 
 
 if __name__ == "__main__":
-    set_start_method('spawn')
+    set_start_method("spawn")
     main()

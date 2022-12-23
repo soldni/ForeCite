@@ -1,12 +1,13 @@
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import ExitStack
 from functools import partial, reduce
-from multiprocessing import get_context, cpu_count
+from multiprocessing import Process, cpu_count, get_context
 from multiprocessing.managers import SyncManager, ValueProxy
 from queue import Queue
-from threading import Lock
+from threading import Event, Lock, Semaphore
 from time import sleep
 from typing import (
+    Any,
     Callable,
     Iterable,
     List,
@@ -32,19 +33,42 @@ class MpTqdm(tqdm):
 
 
 class Bag:
+    """A bag of callable objects that can be executed in parallel.
+    Results are not guaranteed to be in the same order as the callables."""
+
     def __init__(
         self,
         n_proc: int = cpu_count(),
         debug: bool = False,
         timeout: Union[int, float] = 0.1,
-        pbar: Optional[str] = None,
         manager: Optional[SyncManager] = None,
         callback_if_success: Optional[Callable] = None,
         callback_if_failure: Optional[Callable] = None,
     ) -> None:
+        """Initialize a bag of callables.
+
+        Args:
+            n_proc (int, optional): Number of processes to use. Defaults to
+                the number of CPUs on the machine.
+            debug (bool, optional): If True, run the callables sequentially
+                instead of in parallel. Defaults to False.
+            pbar (Optional[str], optional): Description for a tqdm progress
+                bar. If not provided, no progress bar will be shown. Defaults
+                to None.
+            timeout (Union[int, float], optional): How long to wait for a
+                between checking if the processes are done. Defaults to 0.1
+                seconds.
+            manager (Optional[SyncManager], optional): A multiprocessing
+                manager to use. If none is provided, a new one will be
+                created. Defaults to None.
+            callback_if_success (Optional[Callable], optional): A callback
+                to run if all the callables succeed. Defaults to None.
+            callback_if_failure (Optional[Callable], optional): A callback
+                to run if any of the callables fail. Defaults to None.
+        """
+
         self.timeout = float(timeout)
         self.n_proc = n_proc if n_proc > 0 else cpu_count()
-        self.pbar = pbar
         self.debug = debug
 
         self._callable: List[Callable] = []
@@ -53,127 +77,218 @@ class Bag:
 
         self.callback_if_success = callback_if_success or self._null_callback
         self.callback_if_failure = callback_if_failure or self._null_callback
+
         self.manager = (
             self._stack.enter_context(SyncManager(ctx=get_context()))
-            if manager is None else manager
+            if manager is None
+            else manager
         )
+
+        # this queue is used to accumulate the results of the processes
+        self._results_queue: Queue[Any] = self.manager.Queue()
+
+        # this event is used to signal that an exception has been raised in
+        # one of the processes.
+        self._exception_event = self.manager.Event()
+
+        # this event is used to signal that all the processes have finished
+        # successfully, and the results can be retrieved.
+        self._success_event = self.manager.Event()
 
     @staticmethod
     def _null_callback():
+        """A callback that does nothing; used as a default callback
+        if none is provided."""
         pass
 
-    @staticmethod
-    def _monitor_fail(
-        future: Future,
-        callback_if_failure: Callable,
-        callback_fail_lock: Lock
-    ):
-        if future.exception() and callback_fail_lock.acquire(blocking=False):
-            # using the lock to ensure that the callback is only called once
-            # even if multiple futures fail, and blocking=False to ensure that
-            # the acquire method returns False if the lock is already acquired.
-            callback_if_failure()
-
     def add(self, fn: Callable, *args, **kwargs) -> None:
+        """Add a callable to the bag.
+
+        Args:
+            fn (Callable): The callable to add.
+            *args: Arguments to pass to the callable.
+            **kwargs: Keyword arguments to pass to the callable.
+        """
         self._callable.append(partial(fn, *args, **kwargs))
 
-    @staticmethod
-    def _monitor_success(
-        futures: List[Future],
-        timeout: float,
-        callback_if_success: Callable,
-    ):
-        while True:
-            keep_pooling = False
+    def _start_debug(self):
+        """Run the callables sequentially in the main process.
+        Do not use this method directly; use the start() method instead."""
 
-            for f in futures:
-                if not f.done():
-                    sleep(timeout)
-                    keep_pooling = True
-
-            if not keep_pooling:
-                break
-
-        callback_if_success()
-
-    def start_debug(self):
-        resp = []
         while self._callable:
             try:
-                resp.append(self._callable.pop()())
+                # pop the last callable from the list and call it;
+                # append the result to the list of results.
+                fn = self._callable.pop(0)
+                self._results_queue.put_nowait(fn())
             except Exception as e:
+                # if an exception is raised, call the failure callback
                 self.callback_if_failure()
                 raise e
 
+        # no failures, so call the success callback
         self.callback_if_success()
-        return resp
 
-    def results(self):
+        # set the success event so that the results can be retrieved
+        self._success_event.set()
+
+    def results(self) -> List[Any]:
+        """Get the results of the callables.
+        This method will block until all the callables have finished."""
+
+        while not self._success_event.is_set():
+            # wait for the success event to be set
+            sleep(self.timeout)
+
+        # empty the queue of results and return them
+        results = []
+        while not self._results_queue.empty():
+            results.append(self._results_queue.get())
+        return results
+
+    @staticmethod
+    def _process_wrapper(
+        fn: Callable,
+        results_queue: Queue,
+        exception_event: Event,
+    ):
+        """A wrapper for the callables that are run in the processes. It is
+        responsible of adding the results to the results queue after the
+        callable has finished, and toggling the exception event if an
+        exception is raised.
+
+        Args:
+            fn (Callable): The callable to run.
+            results_queue (Queue): The queue to add the results to.
+            exception_event (Event): The event to toggle if an exception
+                is raised.
+        """
+        try:
+            results_queue.put(fn())
+        except Exception as e:
+            exception_event.set()
+            raise e
+
+    @staticmethod
+    def _start_processes(
+        processes: List[Callable],
+        n_proc: int,
+        timeout: float,
+        exception_event: Event,
+        success_event: Event,
+        callback_if_success: Callable,
+        callback_if_failure: Callable,
+    ):
+        """Start the processes and wait for them to finish. If any fails,
+        terminate all the other processes and call the failure callback;
+        if all succeed, call the success callback and set the success event
+        to allow the results to be retrieved.
+
+        Args:
+            processes (List[Callable]): The callables to run.
+            n_proc (int): The number of processes to run.
+            timeout (float): The timeout to use when checking if the
+                processes are done.
+            exception_event (Event): The event to toggle if an exception
+                is raised.
+            success_event (Event): The event to set if all the processes
+                succeed.
+            callback_if_success (Callable): The callback to call if all
+                the processes succeed.
+            callback_if_failure (Callable): The callback to call if any
+                of the processes fail.
+        """
+
+        # keep track of the processes that are running in this list;
+        # this ensures that we don't start more processes than we are
+        # allowed to, and that we are able to terminate them if any
+        # exception is raised.
+        running: List[Process] = []
 
         while True:
-            keep_pooling = True
+            while len(running) < n_proc and len(processes) > 0:
+                # we have more processes to run, and we have room for more!
+                # let's start a few.
+                running.append(p := Process(target=processes.pop(0)))
+                p.start()
 
-            for f in self._futures:
-                if not f.done():
-                    sleep(self.timeout)
-                    keep_pooling = False
+            for i, p in enumerate(running):
+                # let's check if any of the processes has finished
+                if not p.is_alive():
+                    # oh, the i-th has! let's remove it from the list
+                    # of running processes.
+                    running.pop(i)
 
-            if not keep_pooling:
-                break
+            if exception_event.is_set():
+                # uh oh, an exception has been raised in one of the
+                # processes. let's terminate all the other processes
+                # and call the failure callback.
+                for p in running:
+                    p.terminate()
 
-        return [f.result() for f in self._futures]
+                # after the callback is done, we return immediately.
+                callback_if_failure()
+                return
+
+            if len(running) == 0 and len(processes) == 0:
+                # we have no more processes to run, and all the processes
+                # finished successfully. let's call the success callback,
+                # set the success event, and return.
+                success_event.set()
+                callback_if_success()
+                return
+
+            # take a break before checking again
+            sleep(timeout)
 
     def start(self, block: bool = True):
+        """Start the processes.
+
+        Args:
+            block (bool): Whether to block the main process until all the
+                processes have finished. If False, the main process will
+                continue running while the processes are running in the
+                background. To retrieve the results, use the results()
+                method.
+        """
+
         if self.debug:
             # shortcut to run the functions in the main process
-            return self.start_debug()
+            return self._start_debug()
 
-        # empty the list of previous futures
-        del self._futures[:]
-
-        # create a new pool to execute all functions; the pool will be
-        # automatically closed when the context manager exits
-        pool = self._stack.enter_context(ProcessPoolExecutor(self.n_proc))
-
-        # this lock is used to ensure that the callback_if_failure is
-        # only called once even if multiple futures fail
-        callback_fail_lock = self.manager.Lock()
-
+        # we need to remove the processes that have been added so far, and
+        # wrap them into a function that takes care of keeping their return
+        # value and signalling any exceptions.
+        processes = []
         for fn in self._callable:
-            self._futures.append(p := pool.submit(fn))
-            # this callback is used to monitor the status of the future
-            # for failures; if the future fails, the callback will call
-            # the callback_if_failure function once and only once.
-            p.add_done_callback(
+            processes.append(
                 partial(
-                    self._monitor_fail,
-                    callback_if_failure=self.callback_if_failure,
-                    callback_fail_lock=callback_fail_lock
+                    self._process_wrapper,
+                    fn=fn,
+                    results_queue=self._results_queue,
+                    exception_event=self._exception_event,
                 )
             )
 
-        # this callback is used to monitor the status of all futures
-        # for success; if all futures succeed, the callback will call
-        # the callback_if_success function.
-        monitor = partial(
-            self._monitor_success,
-            futures=self._futures,
+        # let's pass all arguments to the executor function; this is needed
+        # in case we want to run the processes in a separate thread.
+        execute_fn = partial(
+            self._start_processes,
+            processes=processes,
+            n_proc=self.n_proc,
             timeout=self.timeout,
+            exception_event=self._exception_event,
+            success_event=self._success_event,
             callback_if_success=self.callback_if_success,
+            callback_if_failure=self.callback_if_failure,
         )
 
         if block:
-            # if block is True, the monitor function will be executed in
-            # the main process.
-            monitor()
+            # block the main process until done.
+            execute_fn()
         else:
-            # if block is False, we start a new thread to execute the
-            # monitor function.
-            self._stack.enter_context(ThreadPoolExecutor(1)).submit(monitor)
-
-    def stop(self):
-        self._stack.close()
-        del self._callable[:]
+            # start the processes in a separate thread.
+            self._stack.enter_context(ThreadPoolExecutor(1)).submit(execute_fn)
 
     def __enter__(self):
         return self
@@ -392,10 +507,11 @@ class Reduce:
 #     return x * 2 + y
 
 
-# def h(x):
+# def h(x, do_print: bool = True, do_raise: bool = True):
 #     sleep(.1)
-#     print(f'step: {x}')
-#     if x >= 5:
+#     if do_print:
+#         print(f'step: {x}')
+#     if x >= 5 and do_raise:
 #         raise ValueError('x must be less than or equal to 5')
 #     return x
 
@@ -417,22 +533,22 @@ class Reduce:
 #         timeout=.1,
 #         callback_if_success=lambda: print('hello')
 #     ) as b:
-#         for i in range(5):
-#             b.add(fn=h, x=i)
-#         b.start()
+#         for i in range(100):
+#             b.add(fn=h, x=i, do_print=False, do_raise=False)
+#         b.start(block=False)
 #         o = b.results()
-#         print(f'result: {o}')
+#         print(f'result: {o[:5]}...')
 
 #     with Bag(
 #         n_proc=0,
 #         timeout=1,
-#         callback_if_failure=lambda: print('sad')
+#         callback_if_failure=lambda: print('sad'),
+#         callback_if_success=lambda: print('you should not see this')
 #     ) as b:
 #         for i in range(10):
 #             b.add(fn=h, x=i)
-#         try:
-#             b.start(block=False)
-#         except ValueError:
-#             b.stop()
+
+#         b.start(block=False)
+
 #         sleep(1)
 #         print('caught error!')
