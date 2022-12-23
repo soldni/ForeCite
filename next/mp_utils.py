@@ -62,19 +62,20 @@ class Bag:
         """
 
         self.timeout = float(timeout)
-        self.n_proc = n_proc if n_proc > 0 else cpu_count()
-        self.debug = debug
+        self._n_proc = n_proc if n_proc > 0 else cpu_count()
+        self._debug = debug
         self.pbar = pbar
+        self.stack = ExitStack()
 
+        self._pbar_count = 0
         self._callable: List[Callable] = []
-        self._stack = ExitStack()
         self._futures: List[Future] = []
 
-        self.callback_if_success = callback_if_success or self._null_callback
-        self.callback_if_failure = callback_if_failure or self._null_callback
+        self._callback_if_success = callback_if_success or self._null_callback
+        self._callback_if_failure = callback_if_failure or self._null_callback
 
         self.manager = (
-            self._stack.enter_context(SyncManager(ctx=get_context()))
+            self.stack.enter_context(SyncManager(ctx=get_context()))
             if manager is None
             else manager
         )
@@ -96,7 +97,12 @@ class Bag:
         if none is provided."""
         pass
 
-    def add(self, fn: Callable, *args, **kwargs) -> None:
+    def add(
+        self,
+        fn: Callable[P, Any],
+        *args: P.args,
+        **kwargs: P.kwargs
+    ) -> None:
         """Add a callable to the bag.
 
         Args:
@@ -125,12 +131,12 @@ class Bag:
             except Exception as e:
                 # if an exception is raised, call the failure callback
                 pbar.close() if pbar else None
-                self.callback_if_failure()
+                self._callback_if_failure()
                 raise e
 
         # no failures, so call the success callback
         pbar.close() if pbar else None
-        self.callback_if_success()
+        self._callback_if_success()
 
         # set the success event so that the results can be retrieved
         self._success_event.set()
@@ -253,7 +259,10 @@ class Bag:
         timeout: float,
         exception_event: Event,
         success_event: Event,
-        description: Optional[str] = None,
+        desc: Optional[str] = None,
+        unit: str = "it",
+        unit_scale: bool = False,
+        position: int = 0,
     ):
         """A thread that updates the progress bar. It will stop when the
         success event is set, or when the exception event is set.
@@ -271,18 +280,38 @@ class Bag:
                 progress bar. If None, the progress bar is not shown.
         """
 
-        if description is None:
-            # no description was provided, so we don't show the progress bar
-            return
+        redraw_every_n_checks = steps_until_redraw = 100
 
-        pbar = tqdm(total=total, desc=description)
+        if desc is None:
+            # no description was provided, so we don't show the progress bar
+            # note that we can't just return here, because we still need to
+            # consume the updates from the counter queue.
+            pbar = None
+        else:
+            # create the progress bar with the given parameters
+            pbar = tqdm(
+                total=total,
+                desc=desc,
+                unit=unit,
+                unit_scale=unit_scale,
+                position=position,
+            )
 
         # loop until we find the stop signal
         while True:
             if exception_event.is_set() or success_event.is_set():
                 # found the stop signal, so we can stop the thread
-                pbar.close()
+                if pbar is not None:
+                    sleep(timeout)
+                    pbar.close()
                 return
+
+            if steps_until_redraw == 0:
+                # we have to redraw the progress bar
+                if pbar is not None:
+                    pbar.refresh()
+                steps_until_redraw = redraw_every_n_checks
+            steps_until_redraw -= 1
 
             if counter_queue.empty():
                 # no updates to the progress bar, so we wait a bit
@@ -290,28 +319,44 @@ class Bag:
                 continue
             else:
                 # this is how much we should increment the progress bar
-                pbar.update(counter_queue.get())
+                count = counter_queue.get()
+                if pbar is not None:
+                    pbar.update(count)
 
-    def _start_progress_bar(self) -> Queue[int]:
+    def add_progress_bar(
+        self,
+        desc: Union[str, None],
+        counter_queue: Optional[Queue[int]] = None,
+        unit: str = "it",
+        unit_scale: bool = False,
+        success_event: Optional[Event] = None,
+        total: Optional[int] = None,
+    ) -> Queue[int]:
         # progress bar has to run in a separate thread, since it is not
         # thread/process safe. We use a queue to communicate with the
         # progress bar thread; the queue is used to send the number of
         # steps to increment the progress bar by.
 
-        counter_queue: Queue[int] = self.manager.Queue()
+        counter_queue = counter_queue or self.manager.Queue()
+        desc = desc or self.pbar
+        success_event = success_event or self._success_event
+        total = total or len(self._callable)
 
-        self._stack.enter_context(ThreadPoolExecutor(1)).submit(
+        self.stack.enter_context(ThreadPoolExecutor(1)).submit(
             partial(
                 self._progress_bar_thread,
                 counter_queue=counter_queue,
-                total=len(self._callable),
+                total=total,
                 timeout=self.timeout,
-                description=self.pbar,
+                desc=desc,
                 exception_event=self._exception_event,
-                success_event=self._success_event,
+                success_event=success_event,
+                unit=unit,
+                unit_scale=unit_scale,
+                position=self._pbar_count,
             )
         )
-
+        self._pbar_count += 1
         return counter_queue
 
     def start(self, block: bool = True):
@@ -325,13 +370,13 @@ class Bag:
                 method.
         """
 
-        if self.debug:
+        if self._debug:
             # shortcut to run the functions in the main process
             return self._start_debug()
 
         # create a queue to store the progress in how many processes have
         # finished; this is used to update the progress bar
-        counter_queue = self._start_progress_bar()
+        counter_queue = self.add_progress_bar(desc=self.pbar)
 
         # we need to remove the processes that have been added so far, and
         # wrap them into a function that takes care of keeping their return
@@ -353,12 +398,12 @@ class Bag:
         execute_fn = partial(
             self._start_processes,
             processes=processes,
-            n_proc=self.n_proc,
+            n_proc=self._n_proc,
             timeout=self.timeout,
             exception_event=self._exception_event,
             success_event=self._success_event,
-            callback_if_success=self.callback_if_success,
-            callback_if_failure=self.callback_if_failure,
+            callback_if_success=self._callback_if_success,
+            callback_if_failure=self._callback_if_failure,
         )
 
         if block:
@@ -366,13 +411,13 @@ class Bag:
             execute_fn()
         else:
             # start the processes in a separate thread.
-            self._stack.enter_context(ThreadPoolExecutor(1)).submit(execute_fn)
+            self.stack.enter_context(ThreadPoolExecutor(1)).submit(execute_fn)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._stack.close()
+        self.stack.close()
 
 
 class Map(Bag):
@@ -396,7 +441,18 @@ class Reduce(Bag):
         self._len_sequence_to_reduce: Union[int, None] = None
         self._counter_queue: Union[Queue[int], None] = None
 
-    def _start_progress_bar(self) -> Queue[int]:
+    def add_progress_bar(
+        self,
+        desc: Union[str, None],
+        *args,
+        **kwargs,
+    ) -> Queue[int]:
+
+        if desc != self.pbar:
+            return super().add_progress_bar(    # type: ignore
+                desc=desc, *args, **kwargs
+            )
+
         if self._counter_queue is not None:
             # we already showed the progress bar, so we don't need to show
             return self._counter_queue
@@ -409,22 +465,12 @@ class Reduce(Bag):
         assert self._len_sequence_to_reduce is not None
         total = ts(self._len_sequence_to_reduce)
 
-        # progress bar has to run in a separate thread, since it is not
-        # thread/process safe. We use a queue to communicate with the
-        # progress bar thread; the queue is used to send the number of
-        # steps to increment the progress bar by.
-        self._stack.enter_context(ThreadPoolExecutor(1)).submit(
-            partial(
-                self._progress_bar_thread,
-                counter_queue=self._counter_queue,
-                total=total,
-                timeout=self.timeout,
-                description=self.pbar,
-                exception_event=self._exception_event,
-                success_event=self._reduce_success_event,
-            )
+        return super().add_progress_bar(
+            desc=desc,
+            counter_queue=self._counter_queue,
+            total=total,
+            success_event=self._reduce_success_event,
         )
-        return self._counter_queue
 
     def __call__(
         self,
@@ -446,6 +492,25 @@ class Reduce(Bag):
         self._reduce_success_event.set()
         self._counter_queue = None
         return seq[0]
+
+
+def F(x):
+    sleep(.1)
+    return x + 1
+
+
+if __name__ == '__main__':
+    # with Bag(1) as b:
+    #     b.add(F, 1)
+    #     b.start(block=False)
+    #     o = b.results()
+    #     print(o)
+
+    with Map(1, pbar='test') as m:
+        o = m(F, range(10))
+        print(o)
+
+
 
 
 # def f(x, y):

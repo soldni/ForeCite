@@ -4,8 +4,11 @@ import json
 import multiprocessing
 import os
 from collections import Counter
+from queue import Queue
 import re
 from string import punctuation
+from time import sleep
+from turtle import update
 from typing import Counter as CounterType, cast
 from typing import Iterable, Optional, Sequence, Set, Union
 
@@ -14,26 +17,34 @@ import springs as sp
 from cached_path import cached_path
 from necessary import necessary
 from spacy.tokens import Span
-from textacy.extract.basics import noun_chunks as textacy_noun_chunks
-from ftfy import fix_text
+from spacy.tokenizer import Tokenizer
+from spacy.parts_of_speech import DET
+from tqdm import tqdm
+import unidecode
+from blingfire import text_to_words
 
 from .io_utils import read_file, recursively_list_files, write_file
-from .mp_utils import Map, Reduce
+from .mp_utils import Bag, Map, Reduce
 
+
+class BlingfireTokenizer(Tokenizer):
+    def __init__(self) -> None:
+        super().__init__()
 
 class NounChunkExtractor:
     _SPACY_DISABLE = ["ner", "textcat"]
+
 
     def __init__(
         self,
         spacy_model_name: str = "en_core_web_sm",
         spacy_disable: Optional[Sequence[str]] = None,
-        return_lemma: bool = False,
+        return_lemma: bool = True,
         return_lower: bool = True,
     ):
         with necessary(
-            modules="en_core_web_sm",
-            message="Please run `python -m spacy download en_core_web_sm`",
+            modules=spacy_model_name,
+            message=f"Run `python -m spacy download {spacy_model_name}`",
         ):
             self.nlp = spacy.load(
                 spacy_model_name,
@@ -63,7 +74,13 @@ class NounChunkExtractor:
         return stopwords
 
     def process_chunk(self, chunk: Span) -> Union[str, None]:
-        if (chunk.end_char - chunk.start_char) < 3 or len(chunk) >= 10:
+        if chunk[0].pos == DET:
+            return self.process_chunk(chunk[1:])
+
+        if len(chunk) >= 10:
+            return None
+
+        if all(len(t) < 3 for t in chunk):
             return None
 
         if self.leading_digits_re.match(chunk[0].text):
@@ -81,12 +98,16 @@ class NounChunkExtractor:
             # first character is punctuation
             return None
 
-        if text.startswith('http://') or text.startswith('https://'):
+        if (
+            text.startswith('http://') or
+            text.startswith('https://') or
+            text.startswith('www.')
+        ):
             # is a URL
             return None
 
-        text = fix_text(text)
-
+        # text = fix_text(text)
+        text = unidecode.unidecode_expect_nonascii(text)
         return text
 
     def get_lemma(self, span: Span) -> str:
@@ -100,10 +121,7 @@ class NounChunkExtractor:
     ) -> Iterable[Set[str]]:
         text = [text] if isinstance(text, str) else text
         for doc in self.nlp.pipe(text):
-            chunks = set(
-                self.process_chunk(chunk)
-                for chunk in textacy_noun_chunks(doc, drop_determiners=True)
-            )
+            chunks = set(self.process_chunk(nc) for nc in doc.noun_chunks)
             chunks.discard(None)
             yield cast(Set[str], chunks)
 
@@ -130,56 +148,124 @@ def escape_line_breaks(text: str) -> str:
     )
 
 
-def process_single(path: str, cfg: "Config") -> CounterType[str]:
-    ids, years, texts = [], [], []
+def process_single(
+    path: str,
+    cfg: "Config",
+    vocab_queue: Queue[CounterType[str]]
+):
+    nce = NounChunkExtractor()
+    # vocab: CounterType[str] = Counter()
 
-    h = hashlib.md5()
-    with read_file(path, mode="rb") as f:
-        raw_content = gzip.decompress(f.read()).decode("utf-8")
+    texts, to_write = [], []
+
+    with read_file(path, mode="rb") as in_f:
+        raw_content = gzip.decompress(in_f.read()).decode("utf-8")
         for ln in escape_line_breaks(raw_content).splitlines():
-            h.update(ln.encode("utf-8"))
+            # h.update(ln.encode("utf-8"))
             data = json.loads(ln)
 
-            ids.append(data["id"])
-            years.append(data["year"])
-            texts.append(
-                ("{title}\n\n\n{abstract}\n\n\n{full_text}")
-                .format(**data)
-                .strip()
+            # ids.append(data["id"])
+            # years.append(data["year"])
+
+            t, a, ft = data["title"], data["abstract"], data["full_text"]
+
+            texts = [
+                (t.strip() if t else ""),
+                (a.strip() if a else ""),
+                *(ft.strip().split('\n\n') if ft else ""),
+            ]
+
+            noun_chunks = Counter(nc for ncs in nce(texts) for nc in ncs)
+
+            vocab_queue.put(noun_chunks)
+
+            data = dict(
+                id=data['id'],
+                year=data['year'],
+                noun_chunks=sorted(noun_chunks)
             )
+            to_write.append(json.dumps(data))
+            # out_f.write(
+            #     gzip.compress(json.dumps(data).encode('utf-8') + b'\n')
+            # )
 
-    nce = NounChunkExtractor()
-    vocab: CounterType[str] = Counter()
-
+    (h := hashlib.md5()).update(path.encode("utf-8"))
     out_filepath = os.path.join(cfg.output, "np", f"{h.hexdigest()}.jsonl")
+    with write_file(out_filepath, mode='w') as out_f:
+        out_f.writelines(to_write)
 
-    with write_file(out_filepath) as f:
-        for id_, year, nc in zip(ids, years, nce(texts)):
-            nc_dict = Counter(w for w in nc)
-            vocab.update(nc_dict)
-            f.write(
-                json.dumps(
-                    dict(id=id_, year=year, noun_chunks=sorted(nc_dict))
-                )
-                + "\n"
-            )
-    return vocab
+    # return vocab
+
+            # texts.append(
+            #     ("{title}\n\n\n{abstract}\n\n\n{full_text}")
+            #     .format(**data)
+            #     .strip()
+            # )
+
+    # out_filepath = os.path.join(cfg.output, "np", f"{h.hexdigest()}.jsonl")
+
+    # with write_file(out_filepath) as f:
+    #     for id_, year, nc in zip(ids, years, nce(texts)):
+    #         nc_dict = Counter(w for w in nc)
+    #         vocab.update(nc_dict)
+    #         f.write(
+    #             json.dumps(
+    #                 dict(id=id_, year=year, noun_chunks=sorted(nc_dict))
+    #             )
+    #             + "\n"
+    #         )
+    # return vocab
 
 
 @sp.dataclass
 class Config:
     prefix: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_content/"
-    output: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_noun_phrases/"
+    output: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_noun_phrases_ascii/"
     n_proc: int = max(multiprocessing.cpu_count() - 1, 1)
     debug: bool = False
     freq: int = 3
 
 
-def merge_vocabs(*vocabs: CounterType[str]):
-    first, *rest = vocabs
-    for v in rest:
-        first.update(v)
-    return first
+# def merge_vocabs(*vocabs: CounterType[str]):
+#     first, *rest = vocabs
+#     for v in rest:
+#         first.update(v)
+#     return first
+
+
+class Stop:
+    ...
+
+
+def build_vocab(
+    vocab_queue: Queue[Union[CounterType[str], Stop]],
+    pbar_queue: Queue[int],
+    output_path: str,
+    timeout: float = 0.1,
+    min_freq: int = 1
+) -> CounterType[str]:
+    logger = sp.configure_logging('build_vocab')
+
+    vocab: CounterType[str] = Counter()
+
+    while True:
+        if vocab_queue.empty():
+            sleep(timeout)
+
+        partial_vocab = vocab_queue.get()
+        if isinstance(partial_vocab, Stop):
+            break
+
+        pbar_queue.put_nowait(1)
+        vocab.update(partial_vocab)
+
+    logger.info("Writing vocab to disk")
+    with write_file(os.path.join(output_path, "vocab.txt"), "w") as f:
+        for word, count in vocab.most_common():
+            if count < min_freq:
+                break
+            f.write(f"{word}\t{count}\n")
+    logger.info("Done writing vocab to disk!")
 
 
 @sp.cli(Config)
@@ -199,20 +285,47 @@ def main(cfg: Config):
     # get file system depending on protocol in the prefix
     sources = list(recursively_list_files(cfg.prefix))
 
-    map_pool = Map(n_proc=cfg.n_proc, debug=cfg.debug, pbar="Running spacy...")
-    part_vocabs = map_pool(process_single, sources, cfg=cfg)
+    with Map(
+        n_proc=cfg.n_proc,
+        debug=cfg.debug,
+        pbar="Extracting NPs with spacy..."
+    ) as m:
 
-    reduce_pool = Reduce(
-        n_proc=cfg.n_proc, debug=cfg.debug, pbar="Merging vocab..."
-    )
-    vocab = reduce_pool(merge_vocabs, part_vocabs)
+        b = m.stack.enter_context(Bag(1, manager=m.manager))
 
-    with write_file(os.path.join(cfg.output, "vocab.txt"), "w") as f:
-        for word, count in vocab.most_common():
-            if count < cfg.freq:
-                break
-            f.write(f"{word}\t{count}\n")
+        vocab_queue = m.manager.Queue()
+        pbar_queue = m.add_progress_bar(desc="Processing NPs", unit=' docs')
+        b.add(
+            build_vocab,
+            vocab_queue=vocab_queue,
+            pbar_queue=pbar_queue,
+            timeout=0.1,
+            output_path=cfg.output,
+            min_freq=cfg.freq,
+        )
+        b.start(block=False)
+
+        m(process_single, sources, cfg=cfg, vocab_queue=vocab_queue)
+
+        vocab_queue.put(Stop())
+        # vocab, *_ = b.results()
+        b.results()
+
+    # with Reduce(
+    #     n_proc=cfg.n_proc,
+    #     debug=cfg.debug,
+    #     pbar="Merging vocabularies..."
+    # ) as r:
+    #     vocab = r(merge_vocabs, part_vocabs)
+
+    # with write_file(os.path.join(cfg.output, "vocab.txt"), "w") as f:
+    #     for word, count in vocab.most_common():
+    #         if count < cfg.freq:
+    #             break
+    #         f.write(f"{word}\t{count}\n")
 
 
 if __name__ == "__main__":
+    # import cProfile
+    # cProfile.run("main()", "out.profile")
     main()
