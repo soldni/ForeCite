@@ -3,3 +3,4 @@ textacy
 spacy
 cached_path
 necessary
+ftfy

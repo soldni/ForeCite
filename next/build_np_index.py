@@ -1,13 +1,14 @@
 import bisect
 import json
 import os
-from multiprocessing import Manager, cpu_count
+from multiprocessing import Manager, cpu_count, set_start_method
 from queue import Queue
 from time import sleep
 from typing import Callable, Dict, List, NamedTuple, Union
 
 import ftfy
 import springs as sp
+from tqdm import tqdm
 
 from .io_utils import read_file, recursively_list_files, write_file
 from .mp_utils import Bag
@@ -23,7 +24,7 @@ class EOP:
         self.success = success
 
 
-class NounChunkTuple(NamedTuple):
+class NCTuple(NamedTuple):
     text: str
     p_id: int
     year: int
@@ -57,9 +58,9 @@ def term_enhance(
 
 
 def term_to_paper_index_worker(
-    terms_queue: Queue[Union[NounChunkTuple, EOP]],
+    terms_queue: Queue[Union[List[NCTuple], EOP]],
     dest: str,
-    timeout: float = 1.0,
+    timeout: float = 0.1,
     partition_fn: Callable[[str], str] = partition_by_term,
     min_papers: int = 1,
 ):
@@ -87,35 +88,50 @@ def term_to_paper_index_worker(
     """
 
     logger = sp.configure_logging(
-        logger_name="term_to_paper_index_worker", logging_level="INFO"
+        logger_name="term_to_paper_index_worker", logging_level="WARN"
     )
 
     term_papers_index: Dict[str, Dict[str, List[int]]] = {}
     term_years_index: Dict[str, Dict[str, Dict[int, int]]] = {}
 
-    logger.info("Starting writer...")
+    pbar = tqdm(
+        unit_scale=True,
+        unit=' noun chunks'
+    )
 
     while True:
         if terms_queue.empty():
             sleep(timeout)
             continue
 
-        nc = terms_queue.get()
+        ncs = terms_queue.get_nowait()
 
-        if isinstance(nc, EOP):
+        if pbar.n % 100 == 0:
+            qsize = terms_queue.qsize()
+            pbar.set_description(f'Processing terms (~{qsize:,} in queue)')
+
+        if isinstance(ncs, EOP):
             break
 
-        key = partition_fn(nc.text)
+        for nc in ncs:
+            key = partition_fn(nc.text)
 
-        li = term_papers_index.setdefault(key, {}).setdefault(nc.text, [])
-        bisect.insort(li, nc.p_id)
-        (
-            di := term_years_index.setdefault(key, {}).setdefault(nc.text, {})
-        ).setdefault(nc.year, 0)
-        di[nc.year] += 1
+            li = term_papers_index.setdefault(key, {}).setdefault(nc.text, [])
+            bisect.insort(li, nc.p_id)
+            di = term_years_index.setdefault(key, {}).setdefault(nc.text, {})
+            di.setdefault(nc.year, 0)
+            di[nc.year] += 1
 
-    logger.info("Finished processing queue; writing files...")
-    for key, terms in term_papers_index.items():
+        pbar.update(len(ncs))
+
+    pbar.close()
+
+    for key, terms in tqdm(
+        term_papers_index.items(),
+        total=len(term_papers_index),
+        desc='Writing term/papers index files',
+        unit=' part',
+    ):
         path = os.path.join(dest, "term_papers", f"{key}.jsonl")
         with write_file(path, skip_if_empty=True, logger=logger) as f:
             for term, papers in terms.items():
@@ -123,7 +139,12 @@ def term_to_paper_index_worker(
                     continue
                 f.write(json.dumps(dict(term=term, papers=papers)) + "\n")
 
-    for key, terms in term_years_index.items():
+    for key, terms in tqdm(
+        term_years_index.items(),
+        total=len(term_years_index),
+        desc='Writing term/years index files',
+        unit=' part',
+    ):
         path = os.path.join(dest, "term_years", f"{key}.jsonl")
         with write_file(path, skip_if_empty=True, logger=logger) as f:
             for term, years in terms.items():
@@ -131,13 +152,14 @@ def term_to_paper_index_worker(
                     continue
                 f.write(json.dumps(dict(term=term, years=years)) + "\n")
 
-    logger.info("Finished writing files; exiting...")
+    logger.warn("Finished writing files; exiting...")
 
 
 def process_single_nps_file(
     path: str,
-    terms_queue: Queue[Union[NounChunkTuple, EOP]],
+    terms_queue: Queue[Union[List[NCTuple], EOP]],
     term_enhancer_fn: Callable[[str], str] = term_enhance,  # type: ignore
+    batch_size: int = 1000,
 ):
     logger = sp.configure_logging(
         logger_name="process_single_nps_file", logging_level="INFO"
@@ -147,13 +169,21 @@ def process_single_nps_file(
         logger.info(f"Starting reader for {path}...")
         for line in f:
             paper = json.loads(line)
+            batch = []
             for np in paper["noun_chunks"]:
                 term = term_enhancer_fn(np)
-                if term:
-                    nc = NounChunkTuple(
-                        text=np, p_id=paper["id"], year=paper["year"]
-                    )
-                    terms_queue.put(nc)
+                if term is None:
+                    continue
+
+                batch.append(
+                    NCTuple(text=np, p_id=paper["id"], year=paper["year"])
+                )
+                if len(batch) >= batch_size:
+                    terms_queue.put(batch)
+                    batch = []
+
+            if len(batch) > 0:
+                terms_queue.put(batch)
 
     logger.info(f"Finished processing {path}")
 
@@ -164,6 +194,7 @@ class BuildNpsIndicesConfig:
     dst: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_forecite_indices/"
     n_proc: int = max(cpu_count() - 1, 2)
     min_papers: int = 3
+    max_queue: int = 100_000
 
 
 @sp.cli(BuildNpsIndicesConfig)
@@ -200,7 +231,7 @@ def main(cfg: BuildNpsIndicesConfig):
     np_files = recursively_list_files(cfg.src)
 
     with Manager() as m:
-        terms_queue = m.Queue()
+        terms_queue = m.Queue(cfg.max_queue)
 
         with Bag(
             # save one core for the writer
@@ -210,28 +241,25 @@ def main(cfg: BuildNpsIndicesConfig):
             manager=m,
             callback_if_success=lambda: terms_queue.put(EOP(True)),
             callback_if_failure=lambda: terms_queue.put(EOP(False)),
-            error_msg="One of the reader processes failed",
         ) as readers_bag, Bag(
             # one lone core for the writer
             n_proc=1,
             # again, we need to share the manager for the terms queue
             manager=m,
-            error_msg="Writer process failed",
         ) as writer_bag:
 
             writer_bag.add(
-                target=term_to_paper_index_worker,
-                kwargs=dict(
-                    terms_queue=terms_queue,
-                    dest=cfg.dst,
-                    min_papers=cfg.min_papers,
-                ),
+                fn=term_to_paper_index_worker,
+                terms_queue=terms_queue,
+                dest=cfg.dst,
+                min_papers=cfg.min_papers,
             )
 
-            for f in np_files:
+            for i, f in enumerate(np_files):
                 readers_bag.add(
-                    target=process_single_nps_file,
-                    kwargs=dict(path=f, terms_queue=terms_queue),
+                    fn=process_single_nps_file,
+                    path=f,
+                    terms_queue=terms_queue,
                 )
 
             # we don't care about blocking on a successful read, but
@@ -241,4 +269,5 @@ def main(cfg: BuildNpsIndicesConfig):
 
 
 if __name__ == "__main__":
+    set_start_method('spawn')
     main()
