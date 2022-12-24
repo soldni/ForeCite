@@ -3,44 +3,31 @@ import hashlib
 import json
 import multiprocessing
 import os
+import string
 from collections import Counter
 from queue import Queue
-import re
-from string import punctuation
 from time import sleep
-from turtle import update
-from typing import Counter as CounterType, cast
-from typing import Iterable, Optional, Sequence, Set, Union
+from typing import Counter as CounterType
+from typing import Iterable, Optional, Sequence, Set, Union, cast
 
 import spacy
 import springs as sp
-from cached_path import cached_path
-from necessary import necessary
-from spacy.tokens import Span
-from spacy.tokenizer import Tokenizer
-from spacy.parts_of_speech import DET
-from tqdm import tqdm
 import unidecode
-from blingfire import text_to_words
+from necessary import necessary
+from spacy.parts_of_speech import DET
+from spacy.tokens import Span
 
 from .io_utils import read_file, recursively_list_files, write_file
-from .mp_utils import Bag, Map, Reduce
+from .mp_utils import Bag, Map
 
-
-class BlingfireTokenizer(Tokenizer):
-    def __init__(self) -> None:
-        super().__init__()
 
 class NounChunkExtractor:
-    _SPACY_DISABLE = ["ner", "textcat"]
-
+    _SPACY_DISABLE = ["ner", "textcat", "lemmatizer"]
 
     def __init__(
         self,
         spacy_model_name: str = "en_core_web_sm",
         spacy_disable: Optional[Sequence[str]] = None,
-        return_lemma: bool = True,
-        return_lower: bool = True,
     ):
         with necessary(
             modules=spacy_model_name,
@@ -50,30 +37,47 @@ class NounChunkExtractor:
                 spacy_model_name,
                 disable=(spacy_disable or self._SPACY_DISABLE),
             )
+        self.punctuation = set(string.punctuation)
+        self.letters = set(string.ascii_lowercase)
 
-        self.return_lemma = return_lemma
-        self.return_lower = return_lower
-        self.leading_digits_re = re.compile(r"^[\d,\.]+\b")
-        self.stopwords = self.get_stopwords()
-        self.punctuation = set(punctuation)
-
-    @staticmethod
-    def get_stopwords(
-        url: str = (
-            "https://ai2-s2-research-public.s3-us-west-2.amazonaws.com/"
-            "lucas/Alir3z4-stop-words-6dedf5e/english.txt"
-        ),
-    ) -> Set[str]:
-
-        with open(cached_path(url), "r") as f:
-            stopwords = set(f.read().splitlines())
-        stopwords.update({
-            'table', 'tables', 'tab', 'tab.', 'tabs', 'tabs.',
-            'figure', 'figures', 'fig', 'fig.', 'figs', 'figs.'
-        })
-        return stopwords
+        self.nlp.Defaults.stop_words |= {
+            "abstract",
+            "al",
+            "appendices",
+            "appendix",
+            "author",
+            "authors",
+            "e.g.",
+            "eq",
+            "eqs",
+            "equation",
+            "equations",
+            "et",
+            "fig",
+            "figs",
+            "figure",
+            "figures",
+            "i.e.",
+            "sec",
+            "section",
+            "subsection",
+            "tab",
+            "table",
+            "tables",
+            "tabs",
+            "title",
+        }
 
     def process_chunk(self, chunk: Span) -> Union[str, None]:
+        if (
+            chunk[0].like_num
+            or chunk[0].like_email
+            or chunk[0].like_url
+            or chunk[0].is_punct
+        ):
+            # first token is a number
+            return None
+
         if chunk[0].pos == DET:
             return self.process_chunk(chunk[1:])
 
@@ -83,57 +87,30 @@ class NounChunkExtractor:
         if all(len(t) < 3 for t in chunk):
             return None
 
-        if self.leading_digits_re.match(chunk[0].text):
-            # first token is a number
+        if len(chunk) == 1 and chunk[0].is_stop:
             return None
 
-        text = chunk.lemma_ if self.return_lemma else chunk.text
-        text = text.lower() if self.return_lower else text
-
-        if text in self.stopwords:
-            # full chunk is a stopword
-            return None
+        text = chunk.text.lower().strip()
 
         if text[0] in self.punctuation:
             # first character is punctuation
             return None
 
-        if (
-            text.startswith('http://') or
-            text.startswith('https://') or
-            text.startswith('www.')
-        ):
-            # is a URL
+        if not text.isascii():
+            text = unidecode.unidecode_expect_nonascii(text)
+
+        if not any(c in self.letters for c in text):
+            # no letters
             return None
 
-        # text = fix_text(text)
-        text = unidecode.unidecode_expect_nonascii(text)
         return text
 
-    def get_lemma(self, span: Span) -> str:
-        return span.lemma_ if self.return_lemma else span.text
-
-    def get_lower(self, span_text: str) -> str:
-        return (span_text.lower() if self.return_lower else span_text).strip()
-
-    def __call__(
-        self, text: Union[str, Sequence[str]]
-    ) -> Iterable[Set[str]]:
+    def __call__(self, text: Union[str, Sequence[str]]) -> Iterable[Set[str]]:
         text = [text] if isinstance(text, str) else text
         for doc in self.nlp.pipe(text):
             chunks = set(self.process_chunk(nc) for nc in doc.noun_chunks)
             chunks.discard(None)
             yield cast(Set[str], chunks)
-
-
-def get_stopwords(
-    url: str = (
-        "https://ai2-s2-research-public.s3-us-west-2.amazonaws.com/"
-        "lucas/Alir3z4-stop-words-6dedf5e/english.txt"
-    ),
-) -> Set[str]:
-    with open(cached_path(url), "r") as f:
-        return set(f.read().splitlines())
 
 
 def escape_line_breaks(text: str) -> str:
@@ -151,28 +128,22 @@ def escape_line_breaks(text: str) -> str:
 def process_single(
     path: str,
     cfg: "Config",
-    vocab_queue: Queue[CounterType[str]]
+    vocab_queue: Queue[Union[CounterType[str], "Stop"]],
 ):
     nce = NounChunkExtractor()
-    # vocab: CounterType[str] = Counter()
 
     texts, to_write = [], []
 
     with read_file(path, mode="rb") as in_f:
         raw_content = gzip.decompress(in_f.read()).decode("utf-8")
         for ln in escape_line_breaks(raw_content).splitlines():
-            # h.update(ln.encode("utf-8"))
             data = json.loads(ln)
-
-            # ids.append(data["id"])
-            # years.append(data["year"])
-
             t, a, ft = data["title"], data["abstract"], data["full_text"]
 
             texts = [
                 (t.strip() if t else ""),
                 (a.strip() if a else ""),
-                *(ft.strip().split('\n\n') if ft else ""),
+                *(map(str.strip, ft.split("\n")) if ft else ""),
             ]
 
             noun_chunks = Counter(nc for ncs in nce(texts) for nc in ncs)
@@ -180,41 +151,16 @@ def process_single(
             vocab_queue.put(noun_chunks)
 
             data = dict(
-                id=data['id'],
-                year=data['year'],
-                noun_chunks=sorted(noun_chunks)
+                id=data["id"],
+                year=data["year"],
+                noun_chunks=sorted(noun_chunks),
             )
-            to_write.append(json.dumps(data))
-            # out_f.write(
-            #     gzip.compress(json.dumps(data).encode('utf-8') + b'\n')
-            # )
+            to_write.append(json.dumps(data) + "\n")
 
     (h := hashlib.md5()).update(path.encode("utf-8"))
     out_filepath = os.path.join(cfg.output, "np", f"{h.hexdigest()}.jsonl")
-    with write_file(out_filepath, mode='w') as out_f:
+    with write_file(out_filepath, mode="w") as out_f:
         out_f.writelines(to_write)
-
-    # return vocab
-
-            # texts.append(
-            #     ("{title}\n\n\n{abstract}\n\n\n{full_text}")
-            #     .format(**data)
-            #     .strip()
-            # )
-
-    # out_filepath = os.path.join(cfg.output, "np", f"{h.hexdigest()}.jsonl")
-
-    # with write_file(out_filepath) as f:
-    #     for id_, year, nc in zip(ids, years, nce(texts)):
-    #         nc_dict = Counter(w for w in nc)
-    #         vocab.update(nc_dict)
-    #         f.write(
-    #             json.dumps(
-    #                 dict(id=id_, year=year, noun_chunks=sorted(nc_dict))
-    #             )
-    #             + "\n"
-    #         )
-    # return vocab
 
 
 @sp.dataclass
@@ -226,13 +172,6 @@ class Config:
     freq: int = 3
 
 
-# def merge_vocabs(*vocabs: CounterType[str]):
-#     first, *rest = vocabs
-#     for v in rest:
-#         first.update(v)
-#     return first
-
-
 class Stop:
     ...
 
@@ -242,9 +181,9 @@ def build_vocab(
     pbar_queue: Queue[int],
     output_path: str,
     timeout: float = 0.1,
-    min_freq: int = 1
-) -> CounterType[str]:
-    logger = sp.configure_logging('build_vocab')
+    min_freq: int = 1,
+):
+    logger = sp.configure_logging("build_vocab")
 
     vocab: CounterType[str] = Counter()
 
@@ -286,15 +225,14 @@ def main(cfg: Config):
     sources = list(recursively_list_files(cfg.prefix))
 
     with Map(
-        n_proc=cfg.n_proc,
-        debug=cfg.debug,
-        pbar="Extracting NPs with spacy..."
+        n_proc=cfg.n_proc, debug=cfg.debug, pbar="Extracting NPs with spacy..."
     ) as m:
 
-        b = m.stack.enter_context(Bag(1, manager=m.manager))
-
+        b = m.stack.enter_context(Bag(1, manager=m.manager, debug=cfg.debug))
         vocab_queue = m.manager.Queue()
-        pbar_queue = m.add_progress_bar(desc="Processing NPs", unit=' docs')
+        pbar_queue = m.add_progress_bar(
+            desc="Making vocab", unit=" docs", unit_scale=True
+        )
         b.add(
             build_vocab,
             vocab_queue=vocab_queue,
@@ -303,29 +241,19 @@ def main(cfg: Config):
             output_path=cfg.output,
             min_freq=cfg.freq,
         )
-        b.start(block=False)
+
+        if not cfg.debug:
+            b.start(block=False)
 
         m(process_single, sources, cfg=cfg, vocab_queue=vocab_queue)
 
         vocab_queue.put(Stop())
-        # vocab, *_ = b.results()
+
+        if cfg.debug:
+            b.start()
+
         b.results()
-
-    # with Reduce(
-    #     n_proc=cfg.n_proc,
-    #     debug=cfg.debug,
-    #     pbar="Merging vocabularies..."
-    # ) as r:
-    #     vocab = r(merge_vocabs, part_vocabs)
-
-    # with write_file(os.path.join(cfg.output, "vocab.txt"), "w") as f:
-    #     for word, count in vocab.most_common():
-    #         if count < cfg.freq:
-    #             break
-    #         f.write(f"{word}\t{count}\n")
 
 
 if __name__ == "__main__":
-    # import cProfile
-    # cProfile.run("main()", "out.profile")
     main()

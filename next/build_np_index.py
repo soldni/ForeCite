@@ -252,7 +252,7 @@ def main(cfg: BuildNpsIndicesConfig):
                 min_papers=cfg.min_papers,
             )
 
-            for i, f in enumerate(np_files):
+            for f in np_files:
                 readers_bag.add(
                     fn=process_single_nps_file,
                     path=f,

@@ -1,4 +1,4 @@
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from functools import partial
 from multiprocessing import Process, cpu_count, get_context
@@ -69,7 +69,6 @@ class Bag:
 
         self._pbar_count = 0
         self._callable: List[Callable] = []
-        self._futures: List[Future] = []
 
         self._callback_if_success = callback_if_success or self._null_callback
         self._callback_if_failure = callback_if_failure or self._null_callback
@@ -98,10 +97,7 @@ class Bag:
         pass
 
     def add(
-        self,
-        fn: Callable[P, Any],
-        *args: P.args,
-        **kwargs: P.kwargs
+        self, fn: Callable[P, Any], *args: P.args, **kwargs: P.kwargs
     ) -> None:
         """Add a callable to the bag.
 
@@ -118,7 +114,8 @@ class Bag:
 
         pbar = (
             tqdm(desc=self.pbar, total=len(self._callable))
-            if self.pbar else None
+            if self.pbar
+            else None
         )
 
         while self._callable:
@@ -408,10 +405,12 @@ class Bag:
 
         if block:
             # block the main process until done.
-            execute_fn()
+            return execute_fn()
         else:
             # start the processes in a separate thread.
-            self.stack.enter_context(ThreadPoolExecutor(1)).submit(execute_fn)
+            return self.stack.enter_context(ThreadPoolExecutor(1)).submit(
+                execute_fn
+            )
 
     def __enter__(self):
         return self
@@ -429,8 +428,8 @@ class Map(Bag):
         **kwargs: P.kwargs,
     ) -> Sequence[V]:
         for elem in seq:
-            self.add(fn, elem, *args, **kwargs)
-        self.start(block=True)
+            self.add(fn, elem, *args, **kwargs)  # type: ignore
+        self.start(block=False)
         return self.results()
 
 
@@ -449,7 +448,7 @@ class Reduce(Bag):
     ) -> Queue[int]:
 
         if desc != self.pbar:
-            return super().add_progress_bar(    # type: ignore
+            return super().add_progress_bar(  # type: ignore
                 desc=desc, *args, **kwargs
             )
 
@@ -462,6 +461,7 @@ class Reduce(Bag):
         # get the total number of steps to reduce the sequence
         def ts(n: int) -> int:
             return 0 if n < 2 else (n // 2 + ts(n // 2 + n % 2))
+
         assert self._len_sequence_to_reduce is not None
         total = ts(self._len_sequence_to_reduce)
 
@@ -485,91 +485,16 @@ class Reduce(Bag):
 
         while len(seq) > 1:
             while len(seq) > 1:
-                self.add(fn, seq.pop(0), seq.pop(0), *args, **kwargs)
-            self.start(block=True)
+                self.add(
+                    fn,  # type: ignore
+                    seq.pop(0),  # type: ignore
+                    seq.pop(0),  # type: ignore
+                    *args,
+                    **kwargs,
+                )
+            self.start(block=False)
             seq.extend(self.results())
 
         self._reduce_success_event.set()
         self._counter_queue = None
         return seq[0]
-
-
-def F(x):
-    sleep(.1)
-    return x + 1
-
-
-if __name__ == '__main__':
-    # with Bag(1) as b:
-    #     b.add(F, 1)
-    #     b.start(block=False)
-    #     o = b.results()
-    #     print(o)
-
-    with Map(1, pbar='test') as m:
-        o = m(F, range(10))
-        print(o)
-
-
-
-
-# def f(x, y):
-#     sleep(.1)
-#     return x + y
-
-
-# def g(x, y: int = 0):
-#     sleep(.1)
-#     return x * 2 + y
-
-
-# def h(x, do_print: bool = True, do_raise: bool = True):
-#     sleep(.01)
-#     if do_print:
-#         print(f'step: {x}')
-#     if x >= 5 and do_raise:
-#         raise ValueError('x must be less than or equal to 5')
-#     return x
-
-
-# if __name__ == '__main__':
-#     r = Reduce(n_proc=4, debug=False, pbar='reduce')
-#     o = r(f, range(10))
-#     sleep(2)
-#     print(o)
-
-#     m = Map(n_proc=10, debug=False, pbar='map')
-#     o = m(g, range(10))
-#     sleep(2)
-#     print(o)
-
-#     with Map(n_proc=4, pbar='m2') as m, Reduce(n_proc=4, pbar='r2') as r:
-#         o = r(f, m(g, range(10), y=1))
-#         sleep(2)
-#         print(o)
-
-    # with Bag(
-    #     n_proc=2,
-    #     timeout=.1,
-    #     callback_if_success=lambda: print('hello')
-    # ) as b:
-    #     for i in range(100):
-    #         b.add(fn=h, x=i, do_print=False, do_raise=False)
-    #     b.start(block=False)
-    #     o = b.results()
-    #     print(f'result: {o[:5]}...')
-
-    # with Bag(
-    #     n_proc=0,
-    #     timeout=1,
-    #     callback_if_failure=lambda: print('sad'),
-    #     callback_if_success=lambda: print('you should not see this')
-    # ) as b:
-    #     for i in range(6):
-    #         b.add(fn=h, x=i)
-
-    #     try:
-    #         b.start(block=True)
-    #     except Exception:
-    #         sleep(1)
-    #         print('caught error!')
