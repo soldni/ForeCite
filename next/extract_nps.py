@@ -22,7 +22,7 @@ from .mp_utils import Bag, Map
 
 
 class NounChunkExtractor:
-    _SPACY_DISABLE = ["ner", "textcat", "lemmatizer"]
+    _SPACY_DISABLE = ["ner", "textcat"]
 
     def __init__(
         self,
@@ -39,6 +39,7 @@ class NounChunkExtractor:
             )
         self.punctuation = set(string.punctuation)
         self.letters = set(string.ascii_lowercase)
+        self.pl_tags = {self.nlp.vocab.strings[tag] for tag in ("NNS", "NNPS")}
 
         self.nlp.Defaults.stop_words |= {
             "abstract",
@@ -90,7 +91,11 @@ class NounChunkExtractor:
         if len(chunk) == 1 and chunk[0].is_stop:
             return None
 
-        text = chunk.text.lower().strip()
+        # use the lemma if it's a plural noun, otherwise use the text
+        text = "".join(
+            (t.lemma_ if t.tag in self.pl_tags else t.text) + t.whitespace_
+            for t in chunk
+        ).lower()
 
         if text[0] in self.punctuation:
             # first character is punctuation
