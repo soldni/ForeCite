@@ -95,7 +95,7 @@ class NounChunkExtractor:
         text = "".join(
             (t.lemma_ if t.tag in self.pl_tags else t.text) + t.whitespace_
             for t in chunk
-        ).lower()
+        ).lower().strip()
 
         if text[0] in self.punctuation:
             # first character is punctuation
@@ -158,6 +158,8 @@ def process_single(
             data = dict(
                 id=data["id"],
                 year=data["year"],
+                # not all files have citation fields
+                citations=data.get("citations", None),
                 noun_chunks=sorted(noun_chunks),
             )
             to_write.append(json.dumps(data) + "\n")
@@ -170,8 +172,8 @@ def process_single(
 
 @sp.dataclass
 class Config:
-    prefix: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_content/"
-    output: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_noun_phrases_ascii/"
+    prefix: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_content_cits/"
+    output: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_np_cits_ascii/"
     n_proc: int = max(multiprocessing.cpu_count() - 1, 1)
     debug: bool = False
     freq: int = 3
@@ -231,14 +233,17 @@ def main(cfg: Config):
 
     with Map(
         n_proc=cfg.n_proc, debug=cfg.debug, pbar="Extracting NPs with spacy..."
-    ) as m:
+    ) as map_:
 
-        b = m.stack.enter_context(Bag(1, manager=m.manager, debug=cfg.debug))
-        vocab_queue = m.manager.Queue()
-        pbar_queue = m.add_progress_bar(
+        bag_ = map_.stack.enter_context(
+            Bag(1, manager=map_.manager, debug=cfg.debug)
+        )
+        vocab_queue = (Queue if cfg.debug else map_.manager.Queue)()
+
+        pbar_queue = map_.add_progress_bar(
             desc="Making vocab", unit=" docs", unit_scale=True
         )
-        b.add(
+        bag_.add(
             build_vocab,
             vocab_queue=vocab_queue,
             pbar_queue=pbar_queue,
@@ -248,16 +253,16 @@ def main(cfg: Config):
         )
 
         if not cfg.debug:
-            b.start(block=False)
+            bag_.start(block=False)
 
-        m(process_single, sources, cfg=cfg, vocab_queue=vocab_queue)
+        map_(process_single, sources, cfg=cfg, vocab_queue=vocab_queue)
 
         vocab_queue.put(Stop())
 
         if cfg.debug:
-            b.start()
+            bag_.start()
 
-        b.results()
+        bag_.results()
 
 
 if __name__ == "__main__":

@@ -334,7 +334,9 @@ class Bag:
         # progress bar thread; the queue is used to send the number of
         # steps to increment the progress bar by.
 
-        counter_queue = counter_queue or self.manager.Queue()
+        counter_queue = counter_queue or (
+            self.manager.Queue() if not self._debug else Queue()
+        )
         desc = desc or self.pbar
         success_event = success_event or self._success_event
         total = total or len(self._callable)
