@@ -4,11 +4,8 @@ import json
 import multiprocessing
 import os
 import string
-from collections import Counter
 from queue import Queue
-from time import sleep
-from typing import Counter as CounterType
-from typing import Iterable, Optional, Sequence, Set, Union, cast
+from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
 
 import spacy
 import springs as sp
@@ -18,8 +15,13 @@ from spacy.parts_of_speech import DET
 from spacy.tokens import Span
 
 from .io_utils import read_file, recursively_list_files, write_file
-from .mp_utils import Bag, Map
+from .mp_utils import Map
 
+
+class ExtractedNounChunk(NamedTuple):
+    text: str
+    start: int
+    end: int
 
 class NounChunkExtractor:
     _SPACY_DISABLE = ["ner", "textcat"]
@@ -69,7 +71,7 @@ class NounChunkExtractor:
             "title",
         }
 
-    def process_chunk(self, chunk: Span) -> Union[str, None]:
+    def process_chunk(self, chunk: Span) -> Union[ExtractedNounChunk, None]:
         if (
             chunk[0].like_num
             or chunk[0].like_email
@@ -108,14 +110,25 @@ class NounChunkExtractor:
             # no letters
             return None
 
-        return text
+        return ExtractedNounChunk(
+            text=text, start=chunk.start_char, end=chunk.end_char
+        )
 
-    def __call__(self, text: Union[str, Sequence[str]]) -> Iterable[Set[str]]:
+    def __call__(self, text: Union[str, Sequence[str]]) -> Iterable[]:
         text = [text] if isinstance(text, str) else text
+        offset = 0
         for doc in self.nlp.pipe(text):
-            chunks = set(self.process_chunk(nc) for nc in doc.noun_chunks)
-            chunks.discard(None)
-            yield cast(Set[str], chunks)
+            chunks: Dict[str, List[Tuple[int, int]]] = {}
+            for chunk in doc.noun_chunks:
+                extracted = self.process_chunk(chunk=chunk)
+                if extracted is None:
+                    continue
+                chunks.setdefault(extracted.text, []).append(
+                    (extracted.start, extracted.end)
+                )
+            offset += doc.length
+
+            yield chunks
 
 
 def escape_line_breaks(text: str) -> str:
@@ -133,7 +146,7 @@ def escape_line_breaks(text: str) -> str:
 def process_single(
     path: str,
     cfg: "Config",
-    vocab_queue: Queue[Union[CounterType[str], "Stop"]],
+    docs_progress_bar: Queue[int]
 ):
     nce = NounChunkExtractor()
 
@@ -151,9 +164,8 @@ def process_single(
                 *(map(str.strip, ft.split("\n")) if ft else ""),
             ]
 
-            noun_chunks = Counter(nc for ncs in nce(texts) for nc in ncs)
-
-            vocab_queue.put(noun_chunks)
+            noun_chunks = set(nc for ncs in nce(texts) for nc in ncs)
+            docs_progress_bar.put(1)
 
             data = dict(
                 id=data["id"],
@@ -179,41 +191,6 @@ class Config:
     freq: int = 3
 
 
-class Stop:
-    ...
-
-
-def build_vocab(
-    vocab_queue: Queue[Union[CounterType[str], Stop]],
-    pbar_queue: Queue[int],
-    output_path: str,
-    timeout: float = 0.1,
-    min_freq: int = 1,
-):
-    logger = sp.configure_logging("build_vocab")
-
-    vocab: CounterType[str] = Counter()
-
-    while True:
-        if vocab_queue.empty():
-            sleep(timeout)
-
-        partial_vocab = vocab_queue.get()
-        if isinstance(partial_vocab, Stop):
-            break
-
-        pbar_queue.put_nowait(1)
-        vocab.update(partial_vocab)
-
-    logger.info("Writing vocab to disk")
-    with write_file(os.path.join(output_path, "vocab.txt"), "w") as f:
-        for word, count in vocab.most_common():
-            if count < min_freq:
-                break
-            f.write(f"{word}\t{count}\n")
-    logger.info("Done writing vocab to disk!")
-
-
 @sp.cli(Config)
 def main(cfg: Config):
     """
@@ -233,36 +210,21 @@ def main(cfg: Config):
 
     with Map(
         n_proc=cfg.n_proc, debug=cfg.debug, pbar="Extracting NPs with spacy..."
-    ) as map_:
+    ) as map_pool:
 
-        bag_ = map_.stack.enter_context(
-            Bag(1, manager=map_.manager, debug=cfg.debug)
+        # adding a second progress bar for documents; the first one
+        # is for files.
+        docs_progress_bar = map_pool.add_progress_bar(
+            desc="Processed...",
+            unit=" docs",
+            unit_scale=True
         )
-        vocab_queue = (Queue if cfg.debug else map_.manager.Queue)()
-
-        pbar_queue = map_.add_progress_bar(
-            desc="Making vocab", unit=" docs", unit_scale=True
+        map_pool(
+            process_single,
+            sources,
+            cfg=cfg,
+            docs_progress_bar=docs_progress_bar
         )
-        bag_.add(
-            build_vocab,
-            vocab_queue=vocab_queue,
-            pbar_queue=pbar_queue,
-            timeout=0.1,
-            output_path=cfg.output,
-            min_freq=cfg.freq,
-        )
-
-        if not cfg.debug:
-            bag_.start(block=False)
-
-        map_(process_single, sources, cfg=cfg, vocab_queue=vocab_queue)
-
-        vocab_queue.put(Stop())
-
-        if cfg.debug:
-            bag_.start()
-
-        bag_.results()
 
 
 if __name__ == "__main__":
