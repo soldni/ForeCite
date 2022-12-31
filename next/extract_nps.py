@@ -5,7 +5,16 @@ import multiprocessing
 import os
 import string
 from queue import Queue
-from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
+from collections import OrderedDict
+from typing import (
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Union
+)
 
 import spacy
 import springs as sp
@@ -114,21 +123,25 @@ class NounChunkExtractor:
             text=text, start=chunk.start_char, end=chunk.end_char
         )
 
-    def __call__(self, text: Union[str, Sequence[str]]) -> Iterable[]:
+    def __call__(
+        self,
+        text: Union[str, Sequence[str]]
+    ) -> Iterable[ExtractedNounChunk]:
+
         text = [text] if isinstance(text, str) else text
         offset = 0
+
         for doc in self.nlp.pipe(text):
-            chunks: Dict[str, List[Tuple[int, int]]] = {}
             for chunk in doc.noun_chunks:
                 extracted = self.process_chunk(chunk=chunk)
                 if extracted is None:
                     continue
-                chunks.setdefault(extracted.text, []).append(
-                    (extracted.start, extracted.end)
+                yield ExtractedNounChunk(
+                    text=extracted.text,
+                    start=extracted.start + offset,
+                    end=extracted.end + offset
                 )
-            offset += doc.length
-
-            yield chunks
+            offset += len(doc.text_with_ws)
 
 
 def escape_line_breaks(text: str) -> str:
@@ -164,15 +177,25 @@ def process_single(
                 *(map(str.strip, ft.split("\n")) if ft else ""),
             ]
 
-            noun_chunks = set(nc for ncs in nce(texts) for nc in ncs)
+            noun_chunks: Dict[str, List[List[int]]] = OrderedDict()
+            for nc in nce(texts):
+                noun_chunks.setdefault(nc.text, []).append([nc.start, nc.end])
+
             docs_progress_bar.put(1)
 
             data = dict(
                 id=data["id"],
                 year=data["year"],
                 # not all files have citation fields
-                citations=data.get("citations", None),
-                noun_chunks=sorted(noun_chunks),
+                citations=[
+                    ct for ct in (
+                        data.get("citations", None) or []
+                    ) if ct is not None
+                ],
+                # save the individual chunks in noun_chunks...
+                noun_chunks=list(noun_chunks.keys()),
+                # ...and the locations of each chunk in nc_locations
+                nc_locations=list(noun_chunks.values()),
             )
             to_write.append(json.dumps(data) + "\n")
 
@@ -184,11 +207,10 @@ def process_single(
 
 @sp.dataclass
 class Config:
-    prefix: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_content_cits/"
-    output: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_np_cits_ascii/"
+    prefix: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_content_cits_clean/"
+    output: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_np_cits_ascii_clean/"
     n_proc: int = max(multiprocessing.cpu_count() - 1, 1)
     debug: bool = False
-    freq: int = 3
 
 
 @sp.cli(Config)
