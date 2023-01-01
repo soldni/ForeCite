@@ -32,6 +32,7 @@ class ExtractedNounChunk(NamedTuple):
     start: int
     end: int
 
+
 class NounChunkExtractor:
     _SPACY_DISABLE = ["ner", "textcat"]
 

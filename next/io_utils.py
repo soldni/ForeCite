@@ -104,12 +104,14 @@ def recursively_list_files(
 
         while len(prefixes) > 0:
             prefix = prefixes.pop()
-            response = cl.list_objects_v2(Bucket=parse.netloc, Prefix=prefix)
-            for obj in response["Contents"]:
-                if obj["Key"][-1] == "/":
-                    prefixes.append(obj["Key"])
-                else:
-                    yield f's3://{parse.netloc}/{obj["Key"]}'
+            paginator = cl.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=parse.netloc, Prefix=prefix)
+            for page in pages:
+                for obj in page["Contents"]:
+                    if obj["Key"][-1] == "/":
+                        prefixes.append(obj["Key"])
+                    else:
+                        yield f's3://{parse.netloc}/{obj["Key"]}'
 
     elif parse.scheme == "file" or parse.scheme == "":
         for root, _, files in os.walk(parse.path):

@@ -29,15 +29,36 @@ UNLOAD (
                 ) AS all_paralocs,
                 (
                     CAST(
-                        JSON_PARSE(content.grobid.annotations.table_ref)
+                        IF (
+                            content.grobid.annotations.figure_ref
+                            IS NOT NULL,
+                            JSON_PARSE(
+                                content.grobid.annotations.figure_ref
+                            ),
+                            JSON_PARSE('[]')
+                        )
                         AS ARRAY(json)
                     ) ||
                     CAST(
-                        JSON_PARSE(content.grobid.annotations.bib_ref)
+                        IF (
+                            content.grobid.annotations.bib_ref
+                            IS NOT NULL,
+                            JSON_PARSE(
+                                content.grobid.annotations.bib_ref
+                            ),
+                            JSON_PARSE('[]')
+                        )
                         AS ARRAY(json)
                     ) ||
                     CAST(
-                        JSON_PARSE(content.grobid.annotations.figure_ref)
+                        IF (
+                            content.grobid.annotations.table_ref
+                            IS NOT NULL,
+                            JSON_PARSE(
+                                content.grobid.annotations.table_ref
+                            ),
+                            JSON_PARSE('[]')
+                        )
                         AS ARRAY(json)
                     )
                 ) AS all_internal_refs
@@ -156,7 +177,7 @@ UNLOAD (
         tt.*,
         ct.citations,
         -- make 30 partitions for smaller output files
-        floor(rand() * 3) AS part_id
+        CAST(FLOOR(RAND() * 3) AS INT) AS part_id
     FROM just_para_from_clean_text_table AS tt
     INNER JOIN citations_table AS ct
         ON tt.id = ct.id
