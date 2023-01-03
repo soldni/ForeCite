@@ -5,14 +5,13 @@ import multiprocessing
 import os
 import string
 from queue import Queue
-from collections import OrderedDict
 from typing import (
-    Dict,
     Iterable,
     List,
     NamedTuple,
     Optional,
     Sequence,
+    Set,
     Union
 )
 
@@ -126,7 +125,7 @@ class NounChunkExtractor:
 
     def __call__(
         self,
-        text: Union[str, Sequence[str]]
+        text: Union[str, Iterable[str]]
     ) -> Iterable[ExtractedNounChunk]:
 
         text = [text] if isinstance(text, str) else text
@@ -157,6 +156,14 @@ def escape_line_breaks(text: str) -> str:
     )
 
 
+def dump_and_gzip(data: Union[dict, list], newline: bool = True) -> bytes:
+    return gzip.compress(
+        (
+            json.dumps(data) + ("\n" if newline else "")
+        ).encode("utf-8")
+    )
+
+
 def process_single(
     path: str,
     cfg: "Config",
@@ -164,46 +171,91 @@ def process_single(
 ):
     nce = NounChunkExtractor()
 
-    texts, to_write = [], []
+    # texts, nps_to_write = [], []
+
+    nps_to_write: List[bytes] = []
+    details_to_write: List[bytes] = []
+
+    part = 0
+
+    (h := hashlib.md5()).update(path.encode("utf-8"))
+    path_hash = h.hexdigest()
+    prefix = path_hash[:cfg.prefix_len]
+
+    def make_path(
+        part: int, root: str = cfg.output, group: Optional[str] = None
+    ) -> str:
+        parts = [root]
+        parts.append(str(group)) if group else None
+        parts.append(prefix) if prefix else None
+        parts.append(f"{path_hash}_{part}.jsonl.gz")
+        return os.path.join(*parts)
 
     with read_file(path, mode="rb") as in_f:
         raw_content = gzip.decompress(in_f.read()).decode("utf-8")
         for ln in escape_line_breaks(raw_content).splitlines():
             data = json.loads(ln)
-            t, a, ft = data["title"], data["abstract"], data["full_text"]
 
-            texts = [
-                (t.strip() if t else ""),
-                (a.strip() if a else ""),
-                *(map(str.strip, ft.split("\n")) if ft else ""),
-            ]
+            noun_chunks: Set[str] = set()
+            noun_chunks_details: List[dict] = []
+            for sec in ("title", "abstract", "full_text"):
+                if not data[sec]:
+                    continue
 
-            noun_chunks: Dict[str, List[List[int]]] = OrderedDict()
-            for nc in nce(texts):
-                noun_chunks.setdefault(nc.text, []).append([nc.start, nc.end])
+                # we add the newline back in so that the start/end offsets
+                # are correct
+                texts = [f"{s}\n" for s in data[sec].split("\n")]
+                for nc in nce(texts):
+                    noun_chunks.add(nc.text)
+                    noun_chunks_details.append(
+                        dict(
+                            text=nc.text, start=nc.start, end=nc.end, sec=sec)
+                    )
+            nps_to_write.append(
+                dump_and_gzip(
+                    {
+                        "id": data["id"],
+                        "year": data["year"],
+                        "citations": [
+                            c for c in data.get("citations", [])
+                            if c is not None
+                        ],
+                        "noun_chunks": list(noun_chunks),
+                    }
+                )
+            )
 
+            details_to_write.append(
+                dump_and_gzip(
+                    {
+                        "id": data["id"],
+                        "noun_chunks": noun_chunks_details,
+                    }
+                )
+            )
             docs_progress_bar.put(1)
 
-            data = dict(
-                id=data["id"],
-                year=data["year"],
-                # not all files have citation fields
-                citations=[
-                    ct for ct in (
-                        data.get("citations", None) or []
-                    ) if ct is not None
-                ],
-                # save the individual chunks in noun_chunks...
-                noun_chunks=list(noun_chunks.keys()),
-                # ...and the locations of each chunk in nc_locations
-                nc_locations=list(noun_chunks.values()),
-            )
-            to_write.append(json.dumps(data) + "\n")
+            if len(nps_to_write) >= cfg.per_file:
+                np_path = make_path(part=part, group='np')
+                with write_file(np_path, mode="wb") as out_f:
+                    out_f.writelines(nps_to_write)
 
-    (h := hashlib.md5()).update(path.encode("utf-8"))
-    out_filepath = os.path.join(cfg.output, "np", f"{h.hexdigest()}.jsonl")
-    with write_file(out_filepath, mode="w") as out_f:
-        out_f.writelines(to_write)
+                details_path = make_path(part=part, group='details')
+                with write_file(details_path, mode="wb") as out_f:
+                    out_f.writelines(details_to_write)
+
+                part += 1
+                nps_to_write, details_to_write = [], []
+
+    if nps_to_write:
+        # write the remaining lines if any
+        np_path = make_path(part=part, group='np')
+        with write_file(np_path, mode="wb") as out_f:
+            out_f.writelines(nps_to_write)
+
+        details_path = make_path(part=part, group='details')
+        with write_file(details_path, mode="wb") as out_f:
+            out_f.writelines(details_to_write)
 
 
 @sp.dataclass
@@ -212,6 +264,8 @@ class Config:
     output: str = "s3://ai2-s2-lucas/s2orc_20221211/acl_np_cits_ascii_clean/"
     n_proc: int = max(multiprocessing.cpu_count() - 1, 1)
     debug: bool = False
+    per_file: int = 1000
+    prefix_len: int = 1
 
 
 @sp.cli(Config)
@@ -228,11 +282,21 @@ def main(cfg: Config):
        frequency.
     """
 
+    # per-file must be an integer > 0
+    assert isinstance(cfg.per_file, int) and cfg.per_file > 0, \
+        "per_file must be an integer > 0"
+
+    # prefix_len must be an 0 <= integer <= (length md5 hash / 2)
+    assert isinstance(cfg.prefix_len, int) and 0 <= cfg.prefix_len <= 16, \
+        "prefix_len must be an integer between 0 and 16"
+
     # get file system depending on protocol in the prefix
     sources = list(recursively_list_files(cfg.prefix))
 
+    docs_progress_bar : Queue[int] = Queue()
+
     with Map(
-        n_proc=cfg.n_proc, debug=cfg.debug, pbar="Extracting NPs with spacy..."
+        n_proc=cfg.n_proc, debug=cfg.debug, pbar="Extracting NPs..."
     ) as map_pool:
 
         # adding a second progress bar for documents; the first one
