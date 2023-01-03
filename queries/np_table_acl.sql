@@ -5,7 +5,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS temp_lucas.np_acl (
     noun_chunks ARRAY<STRING>
 )
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://ai2-s2-lucas/s2orc_20221211/acl_np_cits_ascii_clean'
+LOCATION 's3://ai2-s2-lucas/s2orc_20221211/acl_np_cits_ascii_clean/np'
 
 ----------------
 
